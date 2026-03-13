@@ -95,6 +95,88 @@ python tools/ida_cli.py xrefs 0x401000 --direction both
 python tools/ida_cli.py stop a1b2
 ```
 
+### Usage Examples
+
+#### 1. Basic Analysis Workflow
+
+```bash
+# Start and wait
+python tools/ida_cli.py start ./malware.exe
+python tools/ida_cli.py wait a1b2
+
+# Overview: check functions, strings, imports
+python tools/ida_cli.py functions --count 20
+python tools/ida_cli.py strings --filter "http" --out /tmp/strings.txt
+python tools/ida_cli.py imports --out /tmp/imports.txt
+
+# Deep dive: decompile suspicious function
+python tools/ida_cli.py decompile sub_401000 --out /tmp/sub_401000.c
+
+# Trace call flow
+python tools/ida_cli.py xrefs sub_401000 --direction both
+
+# Done
+python tools/ida_cli.py stop a1b2
+```
+
+#### 2. Multiple Instances
+
+```bash
+# Analyze two binaries simultaneously
+python tools/ida_cli.py start ./client.exe
+python tools/ida_cli.py start ./server.exe
+
+# List running instances
+python tools/ida_cli.py list
+# ID      PORT   BINARY        STATE
+# a1b2    13100  client.exe    ready
+# c3d4    13101  server.exe    ready
+
+# Target specific instance with -b (binary name hint)
+python tools/ida_cli.py -b client functions --filter send
+python tools/ida_cli.py -b server functions --filter recv
+```
+
+#### 3. curl Direct Access (No CLI)
+
+```bash
+# Get auth token from file
+TOKEN=$(grep a1b2 ~/.ida-headless/auth_token | cut -d: -f3)
+
+# Call JSON-RPC directly
+curl -s http://127.0.0.1:13100/jsonrpc \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"method\": \"decompile\", \"params\": {\"addr\": \"main\"}}"
+```
+
+#### 4. Batch Decompile to File
+
+```bash
+# Decompile all functions matching pattern
+for func in $(python tools/ida_cli.py functions --filter "sub_40" --json | jq -r '.[].name'); do
+    python tools/ida_cli.py decompile "$func" --out "/tmp/decompiled/${func}.c"
+done
+```
+
+#### 5. Script Automation (Python)
+
+```python
+import subprocess, json
+
+def ida(cmd):
+    r = subprocess.run(["python", "tools/ida_cli.py"] + cmd + ["--json"],
+                       capture_output=True, text=True)
+    return json.loads(r.stdout)
+
+# Start and analyze
+ida(["start", "./target.so"])
+funcs = ida(["functions", "--filter", "decrypt"])
+for f in funcs:
+    code = ida(["decompile", f["name"]])
+    print(f"=== {f['name']} ===\n{code['pseudocode']}")
+```
+
 ### Commands
 
 #### Instance Management
@@ -317,6 +399,88 @@ python tools/ida_cli.py xrefs 0x401000 --direction both
 
 # 종료
 python tools/ida_cli.py stop a1b2
+```
+
+### 사용 예시
+
+#### 1. 기본 분석 워크플로우
+
+```bash
+# 시작 및 대기
+python tools/ida_cli.py start ./malware.exe
+python tools/ida_cli.py wait a1b2
+
+# 개요 파악: 함수, 문자열, imports 확인
+python tools/ida_cli.py functions --count 20
+python tools/ida_cli.py strings --filter "http" --out /tmp/strings.txt
+python tools/ida_cli.py imports --out /tmp/imports.txt
+
+# 상세 분석: 의심 함수 디컴파일
+python tools/ida_cli.py decompile sub_401000 --out /tmp/sub_401000.c
+
+# 호출 흐름 추적
+python tools/ida_cli.py xrefs sub_401000 --direction both
+
+# 종료
+python tools/ida_cli.py stop a1b2
+```
+
+#### 2. 다중 인스턴스
+
+```bash
+# 두 바이너리 동시 분석
+python tools/ida_cli.py start ./client.exe
+python tools/ida_cli.py start ./server.exe
+
+# 실행 중인 인스턴스 목록
+python tools/ida_cli.py list
+# ID      PORT   BINARY        STATE
+# a1b2    13100  client.exe    ready
+# c3d4    13101  server.exe    ready
+
+# -b로 특정 인스턴스 지정 (바이너리 이름 힌트)
+python tools/ida_cli.py -b client functions --filter send
+python tools/ida_cli.py -b server functions --filter recv
+```
+
+#### 3. curl 직접 호출 (CLI 없이)
+
+```bash
+# auth_token 파일에서 토큰 추출
+TOKEN=$(grep a1b2 ~/.ida-headless/auth_token | cut -d: -f3)
+
+# JSON-RPC 직접 호출
+curl -s http://127.0.0.1:13100/jsonrpc \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"method\": \"decompile\", \"params\": {\"addr\": \"main\"}}"
+```
+
+#### 4. 일괄 디컴파일
+
+```bash
+# 패턴에 맞는 모든 함수 디컴파일
+for func in $(python tools/ida_cli.py functions --filter "sub_40" --json | jq -r '.[].name'); do
+    python tools/ida_cli.py decompile "$func" --out "/tmp/decompiled/${func}.c"
+done
+```
+
+#### 5. 스크립트 자동화 (Python)
+
+```python
+import subprocess, json
+
+def ida(cmd):
+    r = subprocess.run(["python", "tools/ida_cli.py"] + cmd + ["--json"],
+                       capture_output=True, text=True)
+    return json.loads(r.stdout)
+
+# 시작 및 분석
+ida(["start", "./target.so"])
+funcs = ida(["functions", "--filter", "decrypt"])
+for f in funcs:
+    code = ida(["decompile", f["name"]])
+    print(f"=== {f['name']} ===\n{code['pseudocode']}")
 ```
 
 ### 명령어
