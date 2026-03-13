@@ -1,0 +1,1083 @@
+#!/usr/bin/env python3
+"""ida_cli.py — IDA Headless CLI entry point for Claude
+
+Usage:
+    ida_cli.py start <binary> [--fresh] [--force]
+    ida_cli.py stop <id>
+    ida_cli.py list
+    ida_cli.py [-i <id>] decompile <addr>
+    ida_cli.py --help
+"""
+
+import argparse
+import glob
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
+try:
+    import requests as req_lib
+except ImportError:
+    req_lib = None
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _SCRIPT_DIR)
+from arch_detect import arch_detect
+from common import (
+    load_config as _load_config_core,
+    init_registry_paths, acquire_lock, release_lock,
+    load_registry, save_registry,
+    file_md5, remove_auth_token,
+)
+
+_DEFAULT_CONFIG = os.path.join(_SCRIPT_DIR, "config.json")
+
+# ─────────────────────────────────────────────
+# Constants (CLI-specific)
+# ─────────────────────────────────────────────
+
+INSTANCE_ID_LENGTH = 4              # base36 chars for instance ID
+INSTANCE_ID_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
+MD5_PREFIX_LENGTH = 8               # hex chars from MD5 for idb filename
+INIT_STALE_TIMEOUT = 30             # seconds before "initializing" is stale
+START_WAIT_TIMEOUT = 10             # seconds to wait for state after Popen
+START_POLL_INTERVAL = 1             # seconds between start state polls
+STOP_WAIT_ITERATIONS = 10           # iterations waiting for graceful stop
+STOP_POLL_INTERVAL = 0.5            # seconds between stop polls
+STOP_RPC_TIMEOUT = 10               # seconds for stop RPC call
+CLEANUP_AGE_DAYS = 7                # days before orphan logs can be cleaned
+CLEANUP_AGE_SECONDS = CLEANUP_AGE_DAYS * 86400
+STRING_DISPLAY_LIMIT = 80           # max chars for inline string display
+RPC_MAX_RETRIES = 3                 # connection retry attempts
+RPC_RETRY_DELAY = 1                 # seconds between retries
+PID_CREATE_TIME_TOLERANCE = 1.0     # seconds tolerance for PID create time
+
+
+# ─────────────────────────────────────────────
+# Config (wrapper)
+# ─────────────────────────────────────────────
+
+def load_config(config_path=None):
+    if not config_path:
+        config_path = _DEFAULT_CONFIG
+    config_path = os.path.abspath(config_path)
+    return _load_config_core(config_path), config_path
+
+
+# ─────────────────────────────────────────────
+# Auth Token (CLI-specific: read only)
+# ─────────────────────────────────────────────
+
+def _load_auth_token(config, instance_id):
+    token_path = config["security"]["auth_token_file"]
+    try:
+        with open(token_path, encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split(":", 2)
+                if len(parts) == 3 and parts[0] == instance_id:
+                    return parts[2]
+    except FileNotFoundError:
+        pass
+    return None
+
+
+# ─────────────────────────────────────────────
+# Instance ID & IDB path
+# ─────────────────────────────────────────────
+
+def make_instance_id(binary_path):
+    raw = f"{binary_path}{time.time()}{os.getpid()}"
+    h = int(hashlib.md5(raw.encode()).hexdigest(), 16)
+    base = len(INSTANCE_ID_CHARS)
+    result = ""
+    for _ in range(INSTANCE_ID_LENGTH):
+        result = INSTANCE_ID_CHARS[h % base] + result
+        h //= base
+    return result
+
+
+def get_idb_path(config, binary_path, instance_id, force=False, idb_dir=None):
+    if not idb_dir:
+        idb_dir = config["paths"]["idb_dir"]
+    os.makedirs(idb_dir, exist_ok=True)
+    binary_name = os.path.basename(binary_path)
+    name = re.sub(r'[^\w\-.]', '_', binary_name)
+    md5 = hashlib.md5(binary_path.encode()).hexdigest()[:MD5_PREFIX_LENGTH]
+    base = f"{name}_{md5}"
+    suffix = ".i64"
+    if force:
+        return os.path.join(idb_dir, f"{base}_{instance_id}{suffix}")
+    return os.path.join(idb_dir, f"{base}{suffix}")
+
+
+def _load_idb_metadata(idb_path):
+    try:
+        with open(idb_path + ".meta.json", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+# ─────────────────────────────────────────────
+# Process Management
+# ─────────────────────────────────────────────
+
+def _is_process_alive(info):
+    pid = info.get("pid")
+    if not pid:
+        return False
+    if psutil is None:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    try:
+        proc = psutil.Process(pid)
+        stored_ct = info.get("pid_create_time")
+        if stored_ct and abs(proc.create_time() - stored_ct) > PID_CREATE_TIME_TOLERANCE:
+            return False
+        return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+
+
+def cleanup_stale(registry, stale_threshold):
+    now = time.time()
+    changed = False
+    for iid in list(registry.keys()):
+        info = registry[iid]
+        state = info.get("state", "unknown")
+        if state == "initializing":
+            if now - info.get("started", 0) > INIT_STALE_TIMEOUT:
+                del registry[iid]
+                changed = True
+                continue
+        if state == "error":
+            if not _is_process_alive(info):
+                del registry[iid]
+                changed = True
+            continue
+        hb = info.get("last_heartbeat")
+        if not hb:
+            if info.get("pid") and not _is_process_alive(info):
+                del registry[iid]
+                changed = True
+            continue
+        if now - hb > stale_threshold:
+            if not _is_process_alive(info):
+                del registry[iid]
+                changed = True
+    if changed:
+        save_registry(registry)
+    return registry
+
+
+# ─────────────────────────────────────────────
+# RPC Communication
+# ─────────────────────────────────────────────
+
+_BATCH_METHODS = {"decompile_batch", "exec"}
+
+
+def post_rpc(config, port, method, instance_id, params=None, timeout=None):
+    if req_lib is None:
+        return {"error": {"code": "MISSING_DEP",
+                          "message": "requests package not installed (pip install requests)"}}
+    if timeout is None:
+        timeout = config["analysis"]["request_timeout_batch"] if method in _BATCH_METHODS \
+            else config["analysis"]["request_timeout"]
+    url = f"http://127.0.0.1:{port}/"
+    body = {"method": method, "id": 1}
+    if params:
+        body["params"] = params
+    headers = {"Content-Type": "application/json"}
+    token = _load_auth_token(config, instance_id)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    for attempt in range(RPC_MAX_RETRIES):
+        try:
+            resp = req_lib.post(url, json=body, headers=headers, timeout=timeout)
+            try:
+                return resp.json()
+            except ValueError:
+                return {"error": {"code": "INVALID_RESPONSE",
+                         "message": f"HTTP {resp.status_code}: {resp.text[:200]}"}}
+        except req_lib.ConnectionError:
+            if attempt < RPC_MAX_RETRIES - 1:
+                time.sleep(RPC_RETRY_DELAY)
+                continue
+            return {"error": {"code": "CONNECTION_FAILED",
+                     "message": f"Cannot connect to 127.0.0.1:{port}"}}
+        except req_lib.Timeout:
+            return {"error": {"code": "TIMEOUT",
+                     "message": f"Request timeout ({timeout}s)"}}
+    return {"error": {"code": "UNKNOWN", "message": "Unexpected error"}}
+
+
+# ─────────────────────────────────────────────
+# Instance Selection
+# ─────────────────────────────────────────────
+
+def resolve_instance(args, config):
+    registry = load_registry()
+    iid = getattr(args, 'instance', None)
+    if iid:
+        if iid in registry:
+            return iid, registry[iid]
+        print(f"[-] Instance '{iid}' not found")
+        return None, None
+    hint = getattr(args, 'binary_hint', None)
+    if hint:
+        matches = [(k, v) for k, v in registry.items()
+                   if hint.lower() in v.get("binary", "").lower()]
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            print(f"[-] No instance matching '{hint}'")
+        else:
+            print(f"[-] Multiple instances match '{hint}':")
+            for k, v in matches:
+                print(f"  {k}  {v.get('binary', '?')}")
+        return None, None
+    active = {k: v for k, v in registry.items()
+              if v.get("state") in ("ready", "analyzing")}
+    if len(active) == 1:
+        k = next(iter(active))
+        return k, active[k]
+    if not active:
+        print("[-] No active instances. Use 'start' first.")
+    else:
+        print("[-] Multiple active instances. Use -i <id> to select:")
+        for k, v in active.items():
+            print(f"  {k}  {v.get('state', '?'):<12}  {v.get('binary', '?')}")
+    return None, None
+
+
+# ─────────────────────────────────────────────
+# RPC Proxy Helper
+# ─────────────────────────────────────────────
+
+def _rpc_call(args, config, method, params=None):
+    iid, info = resolve_instance(args, config)
+    if not iid:
+        return None
+    if info.get("state") != "ready":
+        print(f"[-] Instance {iid} is not ready (state: {info.get('state')})")
+        return None
+    port = info.get("port")
+    if not port:
+        print(f"[-] Instance {iid} has no port assigned")
+        return None
+    resp = post_rpc(config, port, method, iid, params=params)
+    if "error" in resp:
+        err = resp["error"]
+        if getattr(args, 'json_output', False):
+            print(json.dumps(resp, ensure_ascii=False, indent=2))
+        else:
+            print(f"[-] {err.get('code')}: {err.get('message')}")
+            if err.get("suggestion"):
+                print(f"    Hint: {err['suggestion']}")
+        return None
+    result = resp.get("result", {})
+    if getattr(args, 'json_output', False):
+        print(json.dumps(resp, ensure_ascii=False, indent=2))
+        return None
+    return result
+
+
+# ─────────────────────────────────────────────
+# Commands: Instance Management
+# ─────────────────────────────────────────────
+
+def cmd_init(config):
+    dirs = [config["paths"]["idb_dir"], config["paths"]["log_dir"],
+            os.path.dirname(config["paths"]["registry"])]
+    for d in dirs:
+        os.makedirs(d, exist_ok=True)
+        print(f"  [+] {d}")
+    print("[+] Init complete")
+
+
+def cmd_check(config):
+    issues = []
+    print(f"  Python: {sys.version.split()[0]}")
+    if sys.version_info < (3, 10):
+        issues.append("Python 3.10+ required")
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("idapro")
+        print(f"  idapro: {'found' if spec else 'NOT FOUND'}")
+        if not spec:
+            issues.append("idapro not found")
+    except Exception:
+        issues.append("idapro check failed")
+    ida_dir = config["ida"]["install_dir"]
+    ok = os.path.isdir(ida_dir)
+    print(f"  IDA dir: {ida_dir} ({'OK' if ok else 'NOT FOUND'})")
+    if not ok:
+        issues.append(f"IDA dir not found: {ida_dir}")
+    for pkg_name, mod in [("requests", req_lib), ("psutil", psutil)]:
+        if mod:
+            print(f"  {pkg_name}: {getattr(mod, '__version__', 'found')}")
+        else:
+            issues.append(f"{pkg_name} not installed")
+            print(f"  {pkg_name}: NOT FOUND")
+    if issues:
+        print(f"\n[-] {len(issues)} issue(s):")
+        for i in issues:
+            print(f"  - {i}")
+    else:
+        print("\n[+] All checks passed")
+
+
+def _register_instance(config, instance_id, binary_path, arch_info,
+                        idb_path, log_path, force):
+    """Register an instance in the registry. Returns True on success."""
+    if not acquire_lock():
+        print("[-] Could not acquire registry lock")
+        return False
+    try:
+        registry = load_registry()
+        cleanup_stale(registry, config["analysis"]["stale_threshold"])
+        if len(registry) >= config["analysis"]["max_instances"]:
+            print(f"[-] Max instances reached ({config['analysis']['max_instances']})")
+            return False
+        for info in registry.values():
+            if (os.path.normcase(info.get("path", "")) == binary_path
+                    and info.get("state") in ("analyzing", "ready")):
+                if not force:
+                    print(f"[!] {os.path.basename(binary_path)} already running "
+                          f"(id: {info['id']}). Use --force.")
+                    return False
+        registry[instance_id] = {
+            "id": instance_id, "pid": None, "port": None,
+            "binary": os.path.basename(binary_path),
+            "path": binary_path,
+            "arch": arch_info.get("arch"), "bits": arch_info.get("bits"),
+            "format": arch_info.get("file_format"),
+            "idb_path": idb_path, "log_path": log_path,
+            "state": "initializing",
+            "started": time.time(),
+            "last_heartbeat": None,
+        }
+        save_registry(registry)
+        return True
+    finally:
+        release_lock()
+
+
+def _spawn_server(config_path, binary_path, instance_id, idb_path, log_path, fresh):
+    """Start ida_server.py as a detached process."""
+    server_script = os.path.join(_SCRIPT_DIR, "ida_server.py")
+    cmd = [sys.executable, server_script, binary_path,
+           "--id", instance_id, "--idb", idb_path,
+           "--log", log_path, "--config", config_path]
+    if fresh:
+        cmd.append("--fresh")
+    flags = 0
+    if sys.platform == "win32":
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    return subprocess.Popen(
+        cmd, creationflags=flags,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def _wait_for_start(instance_id):
+    """Wait until the instance exits the initializing state."""
+    deadline = time.time() + START_WAIT_TIMEOUT
+    state = "initializing"
+    while time.time() < deadline:
+        time.sleep(START_POLL_INTERVAL)
+        info = load_registry().get(instance_id, {})
+        state = info.get("state", "unknown")
+        if state in ("analyzing", "ready", "error"):
+            break
+    return state
+
+
+def cmd_start(args, config, config_path):
+    binary_path = os.path.normcase(os.path.abspath(args.binary))
+    if not os.path.isfile(binary_path):
+        print(f"[-] Binary not found: {binary_path}")
+        return
+
+    arch_info = arch_detect(binary_path, getattr(args, 'arch', None))
+    instance_id = make_instance_id(binary_path)
+    force = getattr(args, 'force', False)
+    fresh = getattr(args, 'fresh', False)
+    idb_dir_override = getattr(args, 'idb_dir', None)
+    idb_path = get_idb_path(config, binary_path, instance_id, force, idb_dir=idb_dir_override)
+
+    if os.path.exists(idb_path) and not fresh:
+        meta = _load_idb_metadata(idb_path)
+        stored_md5 = meta.get("binary_md5")
+        if stored_md5:
+            current_md5 = file_md5(binary_path)
+            if stored_md5 != current_md5:
+                print("[!] Binary changed since .i64 was created.")
+                if not force:
+                    print("  Use --fresh to rebuild, or --force to proceed.")
+                    return
+
+    log_path = os.path.join(config["paths"]["log_dir"], f"{instance_id}.log")
+    if not _register_instance(config, instance_id, binary_path, arch_info,
+                               idb_path, log_path, force):
+        return
+
+    proc = _spawn_server(config_path, binary_path, instance_id, idb_path, log_path, fresh)
+    state = _wait_for_start(instance_id)
+
+    fmt = arch_info.get("file_format", "?")
+    arch = arch_info.get("arch", "?")
+    bits = arch_info.get("bits", "?")
+    print(f"[+] Instance started: {instance_id}")
+    print(f"    Binary:  {os.path.basename(binary_path)} ({fmt} {arch} {bits}bit)")
+    print(f"    IDB:     {idb_path}")
+    print(f"    Log:     {log_path}")
+    print(f"    State:   {state}")
+    print(f"    PID:     {proc.pid}")
+    if state == "error":
+        print(f"[-] Analysis failed. Check: ida_cli.py logs {instance_id}")
+    elif state in ("initializing", "analyzing"):
+        print(f"[*] Still {state}. Use: ida_cli.py wait {instance_id}")
+
+
+def cmd_stop(args, config):
+    iid = args.id
+    registry = load_registry()
+    info = registry.get(iid)
+    if not info:
+        print(f"[-] Instance '{iid}' not found")
+        return
+    port = info.get("port")
+    pid = info.get("pid")
+
+    if port:
+        try:
+            post_rpc(config, port, "stop", iid, timeout=STOP_RPC_TIMEOUT)
+            for _ in range(STOP_WAIT_ITERATIONS):
+                time.sleep(STOP_POLL_INTERVAL)
+                if iid not in load_registry():
+                    print(f"[+] Instance {iid} stopped normally")
+                    return
+        except Exception:
+            pass  # RPC stop failed, fall through to force kill
+
+    if pid:
+        _force_kill(iid, pid, info.get("pid_create_time"))
+
+    if acquire_lock():
+        try:
+            r = load_registry()
+            r.pop(iid, None)
+            save_registry(r)
+        finally:
+            release_lock()
+    remove_auth_token(config["security"]["auth_token_file"], iid)
+
+
+def _force_kill(iid, pid, stored_create_time):
+    """Force kill a process by PID."""
+    if psutil is None:
+        try:
+            os.kill(pid, 9)
+            print(f"[+] Instance {iid} force killed (pid={pid})")
+        except OSError:
+            print(f"[+] Instance {iid} process already gone")
+        return
+    try:
+        proc = psutil.Process(pid)
+        if (stored_create_time
+                and abs(proc.create_time() - stored_create_time) > PID_CREATE_TIME_TOLERANCE):
+            print(f"[+] Instance {iid} process already gone (PID reused)")
+        else:
+            proc.kill()
+            print(f"[+] Instance {iid} force killed (pid={pid})")
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        print(f"[+] Instance {iid} process already gone")
+
+
+def cmd_wait(args, config):
+    iid = args.id
+    timeout = getattr(args, 'timeout', 300)
+    poll = config["analysis"]["wait_poll_interval"]
+    deadline = time.time() + timeout
+    state = "unknown"
+    while time.time() < deadline:
+        info = load_registry().get(iid)
+        if not info:
+            print(f"[-] Instance {iid} not found")
+            return
+        state = info.get("state", "unknown")
+        port = info.get("port")
+        if state in ("initializing", "analyzing"):
+            remaining = int(deadline - time.time())
+            print(f"[*] {state}... ({remaining}s remaining)", flush=True)
+            time.sleep(poll)
+            continue
+        if state == "ready" and port:
+            try:
+                resp = post_rpc(config, port, "ping", iid)
+                if resp.get("result", {}).get("state") == "ready":
+                    print("[+] ready")
+                    return
+            except (ConnectionError, OSError):
+                pass
+        if state == "error":
+            print(f"[-] Analysis failed. Check: ida_cli.py logs {iid}")
+            return
+        time.sleep(poll)
+    print(f"[-] Timeout ({timeout}s). Current state: {state}")
+
+
+def cmd_list(args, config):
+    if not acquire_lock():
+        print("[-] Could not acquire registry lock")
+        return
+    try:
+        registry = load_registry()
+        cleanup_stale(registry, config["analysis"]["stale_threshold"])
+    finally:
+        release_lock()
+    if not registry:
+        print("[*] No active instances")
+        return
+    for iid, info in registry.items():
+        state = info.get("state", "unknown")
+        binary = info.get("binary", "?")
+        port = info.get("port", "-")
+        print(f"  {iid}  {state:<12}  {binary}  port={port}")
+
+
+def cmd_status(args, config):
+    iid = getattr(args, 'id', None)
+    if not iid:
+        cmd_list(args, config)
+        return
+    registry = load_registry()
+    info = registry.get(iid)
+    if not info:
+        print(f"[-] Instance '{iid}' not found")
+        return
+    if info.get("state") == "ready" and info.get("port"):
+        resp = post_rpc(config, info["port"], "status", iid)
+        if "result" in resp:
+            r = resp["result"]
+            print(f"  ID:         {iid}")
+            print(f"  State:      {r.get('state')}")
+            print(f"  Binary:     {r.get('binary')}")
+            print(f"  Functions:  {r.get('func_count')}")
+            print(f"  Decompiler: {r.get('decompiler_available')}")
+            print(f"  IDA:        {r.get('ida_version')}")
+            print(f"  Uptime:     {r.get('uptime')}s")
+            return
+    for k, v in info.items():
+        print(f"  {k}: {v}")
+
+
+def cmd_logs(args, config):
+    iid = args.id
+    info = load_registry().get(iid)
+    if not info:
+        print(f"[-] Instance '{iid}' not found")
+        return
+    log_path = info.get("log_path")
+    if not log_path or not os.path.exists(log_path):
+        print(f"[-] Log file not found: {log_path}")
+        return
+    if getattr(args, 'follow', False):
+        try:
+            with open(log_path, encoding='utf-8') as f:
+                f.seek(0, 2)
+                while True:
+                    line = f.readline()
+                    if line:
+                        print(line, end='', flush=True)
+                    else:
+                        if not os.path.exists(log_path):
+                            print("\n[*] Log file removed")
+                            return
+                        time.sleep(STOP_POLL_INTERVAL)
+        except KeyboardInterrupt:
+            pass
+    else:
+        tail = getattr(args, 'tail', 50)
+        with open(log_path, encoding='utf-8') as f:
+            lines = f.readlines()
+        for line in lines[-tail:]:
+            print(line, end='')
+
+
+def cmd_cleanup(args, config):
+    dry_run = getattr(args, 'dry_run', False)
+    registry = load_registry()
+    active_ids = set(registry.keys())
+    log_dir = config["paths"]["log_dir"]
+    idb_dir = config["paths"]["idb_dir"]
+    cutoff = time.time() - CLEANUP_AGE_SECONDS
+    for f in glob.glob(os.path.join(log_dir, "*.log*")):
+        iid = os.path.basename(f).split(".")[0]
+        if iid not in active_ids and os.path.getmtime(f) < cutoff:
+            if dry_run:
+                print(f"  [dry-run] Would delete: {f}")
+            else:
+                os.remove(f)
+                print(f"  Deleted: {f}")
+    token_path = config["security"]["auth_token_file"]
+    if os.path.exists(token_path) and acquire_lock():
+        try:
+            with open(token_path, encoding="utf-8") as fp:
+                lines = fp.readlines()
+            cleaned = [l for l in lines if l.strip().split(":")[0] in active_ids]
+            removed = len(lines) - len(cleaned)
+            if removed > 0:
+                if dry_run:
+                    print(f"  [dry-run] Would remove {removed} stale auth entries")
+                else:
+                    with open(token_path, "w", encoding="utf-8") as fp:
+                        fp.writelines(cleaned)
+                    print(f"  Removed {removed} stale auth entries")
+        finally:
+            release_lock()
+    for f in glob.glob(os.path.join(idb_dir, "*")):
+        if f.endswith(".meta.json"):
+            continue
+        in_use = any(info.get("idb_path") == f for info in registry.values())
+        if not in_use:
+            print(f"  [info] Unused: {os.path.basename(f)}")
+    print("[+] Cleanup done")
+
+
+# ─────────────────────────────────────────────
+# Commands: Analysis/Modification Proxies
+# ─────────────────────────────────────────────
+
+def _check_inline_limit(text, config):
+    """Truncate and return a warning if max_inline_lines is exceeded."""
+    limit = config.get("output", {}).get("max_inline_lines", 200)
+    lines = text.split("\n")
+    if len(lines) <= limit:
+        return text, False
+    truncated = "\n".join(lines[:limit])
+    truncated += f"\n\n[!] Output truncated ({len(lines)} lines, showing {limit}). Use --out to save full result."
+    return truncated, True
+
+
+def _list_params(args):
+    p = {}
+    if getattr(args, 'offset', None) is not None: p["offset"] = args.offset
+    if getattr(args, 'count', None) is not None: p["count"] = args.count
+    if getattr(args, 'filter', None): p["filter"] = args.filter
+    if getattr(args, 'out', None): p["output"] = args.out
+    return p
+
+
+# ── List-type command factory ──
+
+def _fmt_func(d):
+    return f"  {d['addr']}  {d['name']:<50}  size={d.get('size', 0)}"
+
+
+def _fmt_string(d):
+    val = d.get("value", "")
+    if len(val) > STRING_DISPLAY_LIMIT:
+        val = val[:STRING_DISPLAY_LIMIT - 3] + "..."
+    return f"  {d['addr']}  {val}"
+
+
+def _fmt_import(d):
+    return f"  {d['addr']}  {d.get('module', ''):<20}  {d['name']}"
+
+
+def _fmt_export(d):
+    return f"  {d['addr']}  {d['name']}"
+
+
+_LIST_COMMANDS = {
+    "functions": ("get_functions",
+                  lambda r: f"Total: {r['total']} (showing {r['count']} from offset {r['offset']})",
+                  _fmt_func),
+    "strings":   ("get_strings",
+                  lambda r: f"Total: {r['total']} (showing {r['count']})",
+                  _fmt_string),
+    "imports":   ("get_imports",
+                  lambda r: f"Total: {r['total']} (showing {r['count']})",
+                  _fmt_import),
+    "exports":   ("get_exports",
+                  lambda r: f"Total: {r['total']}",
+                  _fmt_export),
+}
+
+
+def _cmd_proxy_list(args, config, method, header_fn, format_fn):
+    """Common handler for list-type RPC commands."""
+    r = _rpc_call(args, config, method, _list_params(args))
+    if not r:
+        return
+    print(header_fn(r))
+    for d in r.get("data", []):
+        print(format_fn(d))
+
+
+# ── Individual proxy commands ──
+
+def cmd_proxy_segments(args, config):
+    p = {}
+    if getattr(args, 'out', None): p["output"] = args.out
+    r = _rpc_call(args, config, "get_segments", p)
+    if not r: return
+    for d in r.get("data", []):
+        print(f"  {d['start_addr']}-{d['end_addr']}  {d.get('name', ''):<12}  "
+              f"{d.get('class', ''):<8}  size={d.get('size', 0):<8}  {d.get('perm', '')}")
+
+
+def cmd_proxy_decompile(args, config):
+    p = {"addr": args.addr}
+    if getattr(args, 'out', None): p["output"] = args.out
+    r = _rpc_call(args, config, "decompile", p)
+    if not r: return
+    header = f"// {r.get('name', '')} @ {r.get('addr', '')}"
+    code = r.get("code", "")
+    output = f"{header}\n{code}"
+    if not r.get("saved_to"):
+        output, _ = _check_inline_limit(output, config)
+    print(output)
+    if r.get("saved_to"):
+        print(f"\n// Saved to: {r['saved_to']}")
+
+
+def cmd_proxy_decompile_batch(args, config):
+    p = {"addrs": args.addrs}
+    if getattr(args, 'out', None): p["output"] = args.out
+    r = _rpc_call(args, config, "decompile_batch", p)
+    if not r: return
+    lines = [f"Total: {r['total']}, Success: {r['success']}, Failed: {r['failed']}"]
+    for func in r.get("functions", []):
+        if "code" in func:
+            lines.append(f"\n// ── {func['name']} ({func['addr']}) ──")
+            lines.append(func["code"])
+        else:
+            lines.append(f"\n// ── {func.get('addr', '?')} ── ERROR: {func.get('error', '?')}")
+    output = "\n".join(lines)
+    if not r.get("saved_to"):
+        output, _ = _check_inline_limit(output, config)
+    print(output)
+
+
+def cmd_proxy_disasm(args, config):
+    p = {"addr": args.addr}
+    if getattr(args, 'count', None) is not None: p["count"] = args.count
+    if getattr(args, 'out', None): p["output"] = args.out
+    r = _rpc_call(args, config, "disasm", p)
+    if not r: return
+    for ln in r.get("lines", []):
+        print(f"  {ln['addr']}  {ln.get('bytes', ''):<24}  {ln['insn']}")
+
+
+def cmd_proxy_xrefs(args, config):
+    direction = getattr(args, 'direction', 'to')
+    p = {"addr": args.addr}
+    if direction in ("to", "both"):
+        r = _rpc_call(args, config, "get_xrefs_to", p)
+        if r:
+            print(f"Xrefs TO {args.addr} ({r.get('total', 0)})")
+            for ref in r.get("refs", []):
+                print(f"  {ref['from_addr']}  {ref.get('from_name', ''):<30}  {ref['type']}")
+    if direction in ("from", "both"):
+        if direction == "both":
+            print()
+        r = _rpc_call(args, config, "get_xrefs_from", p)
+        if r:
+            print(f"Xrefs FROM {args.addr} ({r.get('total', 0)})")
+            for ref in r.get("refs", []):
+                print(f"  {ref['to_addr']}  {ref.get('to_name', ''):<30}  {ref['type']}")
+
+
+def cmd_proxy_find_func(args, config):
+    p = {"name": args.name}
+    if getattr(args, 'regex', False): p["regex"] = True
+    if getattr(args, 'max', None): p["max_results"] = args.max
+    r = _rpc_call(args, config, "find_func", p)
+    if not r: return
+    print(f"Query: '{r['query']}' ({r['total']} matches)")
+    for m in r.get("matches", []):
+        print(f"  {m['addr']}  {m['name']}")
+
+
+def cmd_proxy_func_info(args, config):
+    r = _rpc_call(args, config, "get_func_info", {"addr": args.addr})
+    if not r: return
+    print(f"  Name:       {r.get('name')}")
+    print(f"  Address:    {r.get('start_ea')} - {r.get('end_ea')}")
+    print(f"  Size:       {r.get('size')}")
+    print(f"  Thunk:      {r.get('is_thunk')}")
+    if r.get("calling_convention"):
+        print(f"  Convention: {r['calling_convention']}")
+    if r.get("return_type"):
+        print(f"  Return:     {r['return_type']}")
+    if r.get("args"):
+        arg_strs = ["{} {}".format(a["type"], a["name"]) for a in r["args"]]
+        print(f"  Args:       {', '.join(arg_strs)}")
+
+
+def cmd_proxy_imagebase(args, config):
+    r = _rpc_call(args, config, "get_imagebase")
+    if r:
+        print(f"  Imagebase: {r['imagebase']}")
+
+
+def cmd_proxy_bytes(args, config):
+    r = _rpc_call(args, config, "get_bytes", {"addr": args.addr, "size": int(args.size)})
+    if not r: return
+    print(f"  Address: {r['addr']}")
+    print(f"  Hex:     {r['hex']}")
+    print(f"  Base64:  {r['raw_b64']}")
+
+
+def cmd_proxy_find_pattern(args, config):
+    p = {"pattern": args.pattern}
+    if getattr(args, 'max', None): p["max_results"] = args.max
+    r = _rpc_call(args, config, "find_bytes", p)
+    if not r: return
+    print(f"Pattern: '{r['pattern']}' ({r['total']} matches)")
+    for addr in r.get("matches", []):
+        print(f"  {addr}")
+
+
+def cmd_proxy_comments(args, config):
+    r = _rpc_call(args, config, "get_comments", {"addr": args.addr})
+    if not r: return
+    print(f"  Address:    {r['addr']}")
+    print(f"  Comment:    {r.get('comment', '')}")
+    print(f"  Repeatable: {r.get('repeatable_comment', '')}")
+    print(f"  Function:   {r.get('func_comment', '')}")
+
+
+def cmd_proxy_methods(args, config):
+    r = _rpc_call(args, config, "methods")
+    if not r: return
+    for m in r.get("methods", []):
+        print(f"  {m['name']:<20}  {m['description']}")
+
+
+def cmd_proxy_rename(args, config):
+    r = _rpc_call(args, config, "set_name", {"addr": args.addr, "name": args.name})
+    if r:
+        print(f"[+] Renamed {r['addr']} -> {r['name']}")
+
+
+def cmd_proxy_comment(args, config):
+    p = {"addr": args.addr, "comment": args.text}
+    if getattr(args, 'repeatable', False): p["repeatable"] = True
+    if getattr(args, 'type', None): p["type"] = args.type
+    r = _rpc_call(args, config, "set_comment", p)
+    if r:
+        print(f"[+] Comment set at {r['addr']}")
+
+
+def cmd_proxy_save(args, config):
+    r = _rpc_call(args, config, "save_db")
+    if r:
+        print(f"[+] Database saved: {r.get('idb_path')}")
+
+
+def cmd_proxy_exec(args, config):
+    p = {"code": args.code}
+    if getattr(args, 'out', None): p["output"] = args.out
+    r = _rpc_call(args, config, "exec", p)
+    if not r: return
+    if r.get("stdout"):
+        print(r["stdout"], end="")
+    if r.get("stderr"):
+        print(f"[stderr] {r['stderr']}", end="")
+
+
+# ─────────────────────────────────────────────
+# Dispatch
+# ─────────────────────────────────────────────
+
+def _build_dispatch(args, config, config_path):
+    """Build the command -> handler mapping."""
+    d = {
+        "start": lambda: cmd_start(args, config, config_path),
+        "stop": lambda: cmd_stop(args, config),
+        "status": lambda: cmd_status(args, config),
+        "wait": lambda: cmd_wait(args, config),
+        "list": lambda: cmd_list(args, config),
+        "logs": lambda: cmd_logs(args, config),
+        "cleanup": lambda: cmd_cleanup(args, config),
+        "segments": lambda: cmd_proxy_segments(args, config),
+        "decompile": lambda: cmd_proxy_decompile(args, config),
+        "decompile_batch": lambda: cmd_proxy_decompile_batch(args, config),
+        "disasm": lambda: cmd_proxy_disasm(args, config),
+        "xrefs": lambda: cmd_proxy_xrefs(args, config),
+        "find_func": lambda: cmd_proxy_find_func(args, config),
+        "func_info": lambda: cmd_proxy_func_info(args, config),
+        "imagebase": lambda: cmd_proxy_imagebase(args, config),
+        "bytes": lambda: cmd_proxy_bytes(args, config),
+        "find_pattern": lambda: cmd_proxy_find_pattern(args, config),
+        "comments": lambda: cmd_proxy_comments(args, config),
+        "methods": lambda: cmd_proxy_methods(args, config),
+        "rename": lambda: cmd_proxy_rename(args, config),
+        "comment": lambda: cmd_proxy_comment(args, config),
+        "save": lambda: cmd_proxy_save(args, config),
+        "exec": lambda: cmd_proxy_exec(args, config),
+    }
+    for cmd_name, (method, header_fn, format_fn) in _LIST_COMMANDS.items():
+        d[cmd_name] = (lambda m=method, h=header_fn, f=format_fn:
+                       _cmd_proxy_list(args, config, m, h, f))
+    return d
+
+
+# ─────────────────────────────────────────────
+# Main (argparse)
+# ─────────────────────────────────────────────
+
+def main():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", dest="json_output", action="store_true", help="JSON output")
+    common.add_argument("--config", default=None, help="config.json path")
+    common.add_argument("-i", dest="instance", default=None, help="Instance ID")
+    common.add_argument("-b", dest="binary_hint", default=None, help="Binary name hint")
+
+    parser = argparse.ArgumentParser(description="IDA Headless CLI", prog="ida_cli.py", parents=[common])
+    parser.add_argument("--init", action="store_true", help="Initialize directories")
+    parser.add_argument("--check", action="store_true", help="Check environment")
+
+    sub = parser.add_subparsers(dest="command")
+
+    # Instance management
+    p = sub.add_parser("start", help="Start instance", parents=[common])
+    p.add_argument("binary")
+    p.add_argument("--arch", default=None)
+    p.add_argument("--fresh", action="store_true")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--idb-dir", default=None, help="IDB save directory (overrides config)")
+
+    p = sub.add_parser("stop", help="Stop instance", parents=[common])
+    p.add_argument("id")
+
+    p = sub.add_parser("status", help="Instance status", parents=[common])
+    p.add_argument("id", nargs="?", default=None)
+
+    p = sub.add_parser("wait", help="Wait for ready", parents=[common])
+    p.add_argument("id")
+    p.add_argument("--timeout", type=int, default=300)
+
+    sub.add_parser("list", help="List instances", parents=[common])
+
+    p = sub.add_parser("logs", help="View logs", parents=[common])
+    p.add_argument("id")
+    p.add_argument("--tail", type=int, default=50)
+    p.add_argument("--follow", action="store_true")
+
+    p = sub.add_parser("cleanup", help="Cleanup stale data", parents=[common])
+    p.add_argument("--dry-run", action="store_true")
+
+    # List queries (data-driven from _LIST_COMMANDS)
+    for name in _LIST_COMMANDS:
+        p = sub.add_parser(name, parents=[common])
+        p.add_argument("--offset", type=int, default=None)
+        p.add_argument("--count", type=int, default=None)
+        p.add_argument("--filter", default=None)
+        p.add_argument("--out", default=None)
+
+    p = sub.add_parser("segments", parents=[common])
+    p.add_argument("--out", default=None)
+
+    # Analysis
+    p = sub.add_parser("decompile", parents=[common])
+    p.add_argument("addr")
+    p.add_argument("--out", default=None)
+
+    p = sub.add_parser("decompile_batch", parents=[common])
+    p.add_argument("addrs", nargs="+")
+    p.add_argument("--out", default=None)
+
+    p = sub.add_parser("disasm", parents=[common])
+    p.add_argument("addr")
+    p.add_argument("--count", type=int, default=None)
+    p.add_argument("--out", default=None)
+
+    p = sub.add_parser("xrefs", parents=[common])
+    p.add_argument("addr")
+    p.add_argument("--direction", choices=["to", "from", "both"], default="to")
+
+    p = sub.add_parser("find_func", parents=[common])
+    p.add_argument("name")
+    p.add_argument("--regex", action="store_true")
+    p.add_argument("--max", type=int, default=None)
+
+    p = sub.add_parser("func_info", parents=[common])
+    p.add_argument("addr")
+
+    sub.add_parser("imagebase", parents=[common])
+
+    p = sub.add_parser("bytes", parents=[common])
+    p.add_argument("addr")
+    p.add_argument("size")
+
+    p = sub.add_parser("find_pattern", parents=[common])
+    p.add_argument("pattern")
+    p.add_argument("--max", type=int, default=None)
+
+    p = sub.add_parser("comments", parents=[common])
+    p.add_argument("addr")
+
+    sub.add_parser("methods", parents=[common])
+
+    # Modification
+    p = sub.add_parser("rename", parents=[common])
+    p.add_argument("addr")
+    p.add_argument("name")
+
+    p = sub.add_parser("comment", parents=[common])
+    p.add_argument("addr")
+    p.add_argument("text")
+    p.add_argument("--repeatable", action="store_true")
+    p.add_argument("--type", choices=["line", "func"], default="line")
+
+    sub.add_parser("save", parents=[common])
+
+    p = sub.add_parser("exec", parents=[common])
+    p.add_argument("code")
+    p.add_argument("--out", default=None)
+
+    args = parser.parse_args()
+
+    config, config_path = load_config(args.config)
+    init_registry_paths(config)
+
+    if args.init:
+        cmd_init(config)
+        return
+    if args.check:
+        cmd_check(config)
+        return
+
+    cmd = args.command
+    if not cmd:
+        parser.print_help()
+        return
+
+    dispatch = _build_dispatch(args, config, config_path)
+    handler = dispatch.get(cmd)
+    if handler:
+        handler()
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

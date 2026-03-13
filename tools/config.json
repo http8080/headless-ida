@@ -1,0 +1,38 @@
+{
+  "ida": {
+    "install_dir": "C:/Program Files/IDA Professional 9.3"
+  },
+  "paths": {
+    "idb_dir":    "%USERPROFILE%/.ida-headless/idb",
+    "log_dir":    "%USERPROFILE%/.ida-headless/logs",
+    "registry":   "%USERPROFILE%/.ida-headless/ida_servers.json"
+  },
+  "analysis": {
+    "auto_save":             true,
+    "wait_timeout":          300,
+    "wait_poll_interval":    2,
+    "heartbeat_interval":    60,
+    "stale_threshold":       300,
+    "open_db_timeout":       600,
+    "max_instances":         3,
+    "request_timeout":       35,
+    "request_timeout_batch": 300
+  },
+  "server": {
+    "host": "127.0.0.1"
+  },
+  "output": {
+    "max_inline_lines":      200,
+    "default_count":         100,
+    "max_count":             500,
+    "encoding":              "utf-8"
+  },
+  "security": {
+    "exec_enabled": false,
+    "auth_token_file": "%USERPROFILE%/.ida-headless/auth_token"
+  },
+  "log": {
+    "max_size_mb": 50,
+    "backup_count": 3
+  }
+}
