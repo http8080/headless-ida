@@ -8,12 +8,12 @@
 
 A CLI-based binary analysis system powered by **idalib** (Hex-Rays official headless library), eliminating the need for IDA Pro GUI.
 
-Integrates with Claude Code's bash_tool for AI-driven automated binary analysis.
+AI assistants (Claude Code, Cursor, etc.) call `ida_cli.py` via shell to perform automated binary analysis — **no MCP required**.
 
 ### Architecture
 
 ```text
-User/Claude → ida_cli.py → HTTP JSON-RPC → ida_server.py (import idapro)
+User/AI → ida_cli.py → HTTP JSON-RPC → ida_server.py (idalib)
 ```
 
 - **No MCP layer** — Pure HTTP JSON-RPC communication
@@ -29,228 +29,63 @@ This project intentionally uses plain HTTP JSON-RPC instead of MCP (Model Contex
 | --- | --- | --- |
 | **Dependencies** | Python stdlib only (`http.server`) | MCP SDK + transport layer required |
 | **Debugging** | `curl` one-liner testable | Requires MCP-aware client |
-| **AI tool compatibility** | Works with any AI that has shell access (Claude Code, Cursor, etc.) | Tied to MCP-compatible clients only |
-| **Deployment** | Single `.py` file, zero config | Server manifest + schema registration needed |
-| **Transparency** | Raw JSON request/response visible in logs | Abstracted behind protocol layers |
-| **idalib constraint** | Single-thread `HTTPServer` maps 1:1 to idalib's requirement | MCP's async model conflicts with idalib's single-thread restriction |
-| **Context window** | Zero overhead — just bash commands | Tool schemas for all MCP methods loaded into AI context, consuming tokens |
+| **AI compatibility** | Any AI with shell access (Claude Code, Cursor, etc.) | MCP-compatible clients only |
+| **Context window** | Zero overhead — just bash commands | Tool schemas loaded into AI context, consuming tokens |
 | **Script automation** | Directly callable from bash/Python scripts | Requires MCP client library |
+| **Deployment** | Single `.py` file, zero config | Server manifest + schema registration needed |
+| **idalib constraint** | Single-thread `HTTPServer` maps 1:1 | MCP async model conflicts with single-thread restriction |
 
-> **TL;DR** — For a tool that wraps a single-threaded native library (idalib), a simple HTTP server is more reliable and portable than MCP. Any AI assistant with bash/shell access can use it immediately.
+> **TL;DR** — Any AI with shell access can use it immediately. No SDK, no schema registration, no token overhead.
 
 ### Requirements
 
 | Component | Version |
 | --------- | ------- |
-| IDA Pro | 9.1+ (idalib + `open_database(args=...)` support) |
+| IDA Pro | 9.1+ (idalib support required) |
 | Python | 3.12 or 3.13 (must match IDA's bundled version) |
 | OS | Windows 10/11 |
 
 > **Warning**: Python 3.14 is incompatible — IDA 9.3 Known Issue ("PySide6 crashes under Python 3.14").
 
-### Installation
+### Setup
+
+#### Step 1. Install idalib Python package
 
 ```bash
-# 1. Install idapro package (whl included in IDA install directory)
 pip install "<IDA_DIR>/idalib/python/idapro-*.whl"
+```
 
-# 2. Register IDA install path (choose one)
+The `.whl` file is included in your IDA Pro installation directory.
+
+#### Step 2. Register IDA path (choose one)
+
+```bash
+# Option A: Run the activation script (recommended)
 python "<IDA_DIR>/idalib/python/py-activate-idalib.py"
-# or
+
+# Option B: Set environment variable
 set IDADIR=C:\Program Files\IDA Professional 9.3
+```
 
-# 3. Install dependencies
+#### Step 3. Install dependencies
+
+```bash
 pip install requests psutil
+```
 
-# 4. Verify environment
+#### Step 4. Verify and initialize
+
+```bash
+# Check environment
 python tools/ida_cli.py --check
 
-# 5. Initialize (create directories)
+# Create working directories
 python tools/ida_cli.py --init
 ```
 
-### Quick Start
+#### Step 5. Configuration (optional)
 
-```bash
-# Start instance
-python tools/ida_cli.py start ./samples/target.so
-# Instance started: id=a1b2
-
-# Wait for analysis to complete
-python tools/ida_cli.py wait a1b2
-
-# List functions
-python tools/ida_cli.py functions --filter main
-
-# Decompile
-python tools/ida_cli.py decompile main --out /tmp/main.c
-
-# Search strings
-python tools/ida_cli.py strings --filter "password" --out /tmp/strings.txt
-
-# Cross-references
-python tools/ida_cli.py xrefs 0x401000 --direction both
-
-# Stop instance
-python tools/ida_cli.py stop a1b2
-```
-
-### Usage Examples
-
-#### 1. Basic Analysis Workflow
-
-```bash
-# Start and wait
-python tools/ida_cli.py start ./malware.exe
-python tools/ida_cli.py wait a1b2
-
-# Overview: check functions, strings, imports
-python tools/ida_cli.py functions --count 20
-python tools/ida_cli.py strings --filter "http" --out /tmp/strings.txt
-python tools/ida_cli.py imports --out /tmp/imports.txt
-
-# Deep dive: decompile suspicious function
-python tools/ida_cli.py decompile sub_401000 --out /tmp/sub_401000.c
-
-# Trace call flow
-python tools/ida_cli.py xrefs sub_401000 --direction both
-
-# Done
-python tools/ida_cli.py stop a1b2
-```
-
-#### 2. Multiple Instances
-
-```bash
-# Analyze two binaries simultaneously
-python tools/ida_cli.py start ./client.exe
-python tools/ida_cli.py start ./server.exe
-
-# List running instances
-python tools/ida_cli.py list
-# ID      PORT   BINARY        STATE
-# a1b2    13100  client.exe    ready
-# c3d4    13101  server.exe    ready
-
-# Target specific instance with -b (binary name hint)
-python tools/ida_cli.py -b client functions --filter send
-python tools/ida_cli.py -b server functions --filter recv
-```
-
-#### 3. curl Direct Access (No CLI)
-
-```bash
-# Get auth token from file
-TOKEN=$(grep a1b2 ~/.ida-headless/auth_token | cut -d: -f3)
-
-# Call JSON-RPC directly
-curl -s http://127.0.0.1:13100/jsonrpc \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"method\": \"decompile\", \"params\": {\"addr\": \"main\"}}"
-```
-
-#### 4. Batch Decompile to File
-
-```bash
-# Decompile all functions matching pattern
-for func in $(python tools/ida_cli.py functions --filter "sub_40" --json | jq -r '.[].name'); do
-    python tools/ida_cli.py decompile "$func" --out "/tmp/decompiled/${func}.c"
-done
-```
-
-#### 5. Script Automation (Python)
-
-```python
-import subprocess, json
-
-def ida(cmd):
-    r = subprocess.run(["python", "tools/ida_cli.py"] + cmd + ["--json"],
-                       capture_output=True, text=True)
-    return json.loads(r.stdout)
-
-# Start and analyze
-ida(["start", "./target.so"])
-funcs = ida(["functions", "--filter", "decrypt"])
-for f in funcs:
-    code = ida(["decompile", f["name"]])
-    print(f"=== {f['name']} ===\n{code['pseudocode']}")
-```
-
-### Commands
-
-#### Instance Management
-
-```bash
-ida_cli.py start   <binary> [--arch <arch>] [--fresh] [--force] [--idb-dir <path>]
-ida_cli.py stop    <id>
-ida_cli.py status  [<id>]
-ida_cli.py wait    <id> [--timeout 300]
-ida_cli.py list
-ida_cli.py logs    <id> [--tail N]
-ida_cli.py cleanup [--dry-run]
-```
-
-#### Analysis
-
-```bash
-ida_cli.py functions    [--count N] [--filter STR] [--out FILE]
-ida_cli.py strings      [--count N] [--filter STR] [--out FILE]
-ida_cli.py imports      [--count N] [--out FILE]
-ida_cli.py exports      [--count N] [--out FILE]
-ida_cli.py segments     [--out FILE]
-ida_cli.py decompile    <addr|name> [--out FILE]
-ida_cli.py disasm       <addr|name> [--count N] [--out FILE]
-ida_cli.py xrefs        <addr> [--direction to|from|both] [--out FILE]
-ida_cli.py find_func    <name> [--regex] [--max N]
-ida_cli.py func_info    <addr|name>
-ida_cli.py imagebase
-ida_cli.py bytes        <addr> <size>
-ida_cli.py find_pattern <hex_pattern> [--max N]
-```
-
-#### Modification
-
-```bash
-ida_cli.py rename  <addr> <new_name>
-ida_cli.py comment <addr> "text" [--type func]
-ida_cli.py save
-```
-
-#### Global Options
-
-| Option | Description |
-| ------ | ----------- |
-| `--json` | JSON output mode |
-| `-i <id>` | Specify instance ID directly |
-| `-b <hint>` | Auto-select instance by binary name substring |
-| `--out FILE` | Save output to file (saves context window) |
-| `--idb-dir <path>` | Override IDB save directory (start only) |
-
-### Project Structure
-
-```text
-tools/
-├── config.json      # Global settings (paths, analysis params, security)
-├── common.py        # Shared module (config, registry, lock, file_md5)
-├── arch_detect.py   # Binary header parsing (ELF, PE, Mach-O, FAT)
-├── ida_server.py    # idalib HTTP JSON-RPC server (24 APIs)
-└── ida_cli.py       # CLI entry point (instance management + analysis proxy)
-```
-
-#### Runtime Files
-
-```text
-%USERPROFILE%\.ida-headless\
-├── ida_servers.json       # Instance registry
-├── auth_token             # Auth tokens (instance_id:port:token)
-├── idb\                   # IDB files (.i64)
-└── logs\                  # Instance logs
-```
-
-### Configuration
-
-Place in `tools/config.json` or `%USERPROFILE%\.ida-headless\config.json`:
+Edit `tools/config.json` to set IDA path and other options:
 
 ```json
 {
@@ -262,51 +97,104 @@ Place in `tools/config.json` or `%USERPROFILE%\.ida-headless\config.json`:
     "log_dir": "%USERPROFILE%/.ida-headless/logs"
   },
   "analysis": {
-    "max_instances": 3,
-    "open_db_timeout": 600,
-    "request_timeout": 35
-  },
-  "security": {
-    "exec_enabled": false
+    "max_instances": 3
   }
 }
 ```
 
-### Supported Formats
-
-| Platform | Formats |
-| -------- | ------- |
-| Windows | PE32, PE64, .NET, DOS MZ |
-| Linux | ELF32, ELF64 |
-| macOS/iOS | Mach-O 32/64, FAT, dylib |
-| Android | ELF ARM/ARM64/x86, .so |
-| Firmware | Raw binary, Intel HEX, SREC |
-
-#### Decompiler Architectures
-
-| Architecture | 32-bit | 64-bit |
-| ------------ | ------ | ------ |
-| x86 | hexrays | hexx64 |
-| ARM | hexarm | hexarm64 |
-| MIPS | hexmips | hexmips64 |
-| PowerPC | hexppc | hexppc64 |
-| RISC-V | hexrv | hexrv64 |
-
-### Claude Code Integration
-
-Register as a Claude Code skill to start automated analysis with `/ida <binary>`.
+#### Step 6. Test it works
 
 ```bash
-# Skill file included at .claude/commands/ida.md
-# Usage: /ida ./target.so in Claude Code
+# Start an instance with any binary
+python tools/ida_cli.py start ./samples/target.exe
+
+# Check status
+python tools/ida_cli.py list
+
+# Stop
+python tools/ida_cli.py stop <id>
 ```
+
+If you see `Instance started: id=xxxx` and the instance appears in `list`, the setup is complete.
+
+### AI Integration
+
+Once the environment is set up, AI assistants use `ida_cli.py` commands via shell. You don't need to memorize these — the AI handles it.
+
+#### Claude Code
+
+A skill file is included at `.claude/commands/ida.md`. Use it with:
+
+```text
+/ida ./target.so
+```
+
+Claude will automatically start an instance, analyze the binary, and report findings.
+
+#### Other AI Tools (Cursor, GPT, etc.)
+
+Any AI with shell/terminal access can call `ida_cli.py` directly. Point the AI to `CLAUDE.md` for the full command reference.
+
+### Command Reference
+
+Commands are primarily used by AI, listed here for reference.
+
+#### Instance Management
+
+| Command | Description |
+| ------- | ----------- |
+| `start <binary>` | Start analysis instance |
+| `stop <id>` | Stop instance |
+| `wait <id>` | Wait for analysis to complete |
+| `list` | List running instances |
+| `status [<id>]` | Show instance status |
+| `logs <id>` | View instance logs |
+| `cleanup` | Remove stale instances |
+
+#### Analysis (24 APIs)
+
+| Command | Description |
+| ------- | ----------- |
+| `functions` | List functions |
+| `strings` | List strings |
+| `imports` / `exports` | List imports/exports |
+| `segments` | List segments |
+| `decompile <addr\|name>` | Decompile function |
+| `disasm <addr\|name>` | Disassemble |
+| `xrefs <addr>` | Cross-references |
+| `find_func <name>` | Search functions |
+| `func_info <addr\|name>` | Function details |
+| `bytes <addr> <size>` | Read raw bytes |
+| `find_pattern <hex>` | Byte pattern search |
+
+#### Modification
+
+| Command | Description |
+| ------- | ----------- |
+| `rename <addr> <name>` | Rename symbol |
+| `comment <addr> "text"` | Add comment |
+| `save` | Save database |
+
+#### Common Options
+
+| Option | Description |
+| ------ | ----------- |
+| `--json` | JSON output |
+| `-i <id>` | Specify instance ID |
+| `-b <hint>` | Auto-select by binary name |
+| `--out FILE` | Save output to file |
+
+### Supported Formats
+
+PE, ELF, Mach-O, FAT, .so, dylib, Raw binary, Intel HEX, SREC
+
+Decompiler: x86/x64, ARM/ARM64, MIPS, PowerPC, RISC-V
 
 ### License
 
-This project is licensed under the **Apache License 2.0**. See [LICENSE](LICENSE) for details.
+**Apache License 2.0** — See [LICENSE](LICENSE).
 
-A valid **IDA Pro license** is required separately to use this project.
-Hex-Rays decompiler license is optional (assembly-only mode without it).
+A valid **IDA Pro license** is required separately. Hex-Rays decompiler license is optional.
 
 ---
 
@@ -314,12 +202,12 @@ Hex-Rays decompiler license is optional (assembly-only mode without it).
 
 IDA Pro GUI 없이 **idalib** (Hex-Rays 공식 헤드리스 라이브러리)을 사용하여 CLI에서 바이너리 분석을 수행하는 시스템.
 
-Claude Code의 bash_tool과 연동하여 AI 기반 자동 바이너리 분석에 활용할 수 있습니다.
+AI 어시스턴트(Claude Code, Cursor 등)가 shell로 `ida_cli.py`를 호출하여 자동 바이너리 분석 — **MCP 불필요**.
 
 ### 아키텍처
 
 ```text
-User/Claude → ida_cli.py → HTTP JSON-RPC → ida_server.py (import idapro)
+User/AI → ida_cli.py → HTTP JSON-RPC → ida_server.py (idalib)
 ```
 
 - **MCP 레이어 없음** — 순수 HTTP JSON-RPC 통신
@@ -335,228 +223,63 @@ User/Claude → ida_cli.py → HTTP JSON-RPC → ida_server.py (import idapro)
 | --- | --- | --- |
 | **의존성** | Python 표준 라이브러리만 (`http.server`) | MCP SDK + transport 레이어 필요 |
 | **디버깅** | `curl` 한 줄로 테스트 가능 | MCP 지원 클라이언트 필요 |
-| **AI 도구 호환성** | shell 접근 가능한 모든 AI에서 동작 (Claude Code, Cursor 등) | MCP 호환 클라이언트에만 종속 |
+| **AI 호환성** | shell 접근 가능한 모든 AI (Claude Code, Cursor 등) | MCP 호환 클라이언트에만 종속 |
+| **컨텍스트 윈도우** | 오버헤드 없음 — bash 명령어만 사용 | tool schema가 AI 컨텍스트에 로드되어 토큰 소모 |
+| **스크립트 자동화** | bash/Python에서 바로 호출 가능 | MCP 클라이언트 라이브러리 필요 |
 | **배포** | `.py` 파일 하나, 별도 설정 없음 | 서버 manifest + 스키마 등록 필요 |
-| **투명성** | Raw JSON 요청/응답이 로그에 그대로 노출 | 프로토콜 레이어 뒤에 추상화됨 |
-| **idalib 제약** | 단일 스레드 `HTTPServer`가 idalib 제약과 1:1 매핑 | MCP의 async 모델이 idalib 단일 스레드 제약과 충돌 |
-| **컨텍스트 윈도우** | 오버헤드 없음 — bash 명령어만 사용 | 모든 MCP 메서드의 tool schema가 AI 컨텍스트에 로드되어 토큰 소모 |
-| **스크립트 자동화** | bash/Python 스크립트에서 바로 호출 가능 | MCP 클라이언트 라이브러리 필요 |
+| **idalib 제약** | 단일 스레드 `HTTPServer`가 1:1 매핑 | MCP async 모델이 단일 스레드 제약과 충돌 |
 
-> **요약** — 단일 스레드 네이티브 라이브러리(idalib)를 감싸는 도구에는 MCP보다 단순한 HTTP 서버가 더 안정적이고 이식성이 높습니다. bash/shell 접근이 가능한 모든 AI 어시스턴트에서 즉시 사용할 수 있습니다.
+> **요약** — shell 접근 가능한 AI면 바로 사용 가능. SDK 불필요, 스키마 등록 불필요, 토큰 오버헤드 없음.
 
 ### 요구사항
 
 | 항목 | 버전 |
 | ---- | ---- |
-| IDA Pro | 9.1 이상 (idalib + `open_database(args=...)` 지원) |
+| IDA Pro | 9.1 이상 (idalib 지원 필수) |
 | Python | 3.12 또는 3.13 (IDA 번들 버전과 일치 필수) |
 | OS | Windows 10/11 |
 
 > **Warning**: Python 3.14는 IDA 9.3 Known Issue ("PySide6 crashes under Python 3.14")로 비호환.
 
-### 설치
+### 환경 구축
+
+#### Step 1. idalib Python 패키지 설치
 
 ```bash
-# 1. idapro 패키지 설치 (IDA 설치 디렉토리에 포함된 whl)
 pip install "<IDA_DIR>/idalib/python/idapro-*.whl"
+```
 
-# 2. IDA 설치 경로 등록 (택일)
+IDA Pro 설치 디렉토리에 `.whl` 파일이 포함되어 있습니다.
+
+#### Step 2. IDA 경로 등록 (택일)
+
+```bash
+# 방법 A: 활성화 스크립트 실행 (권장)
 python "<IDA_DIR>/idalib/python/py-activate-idalib.py"
-# 또는
+
+# 방법 B: 환경 변수 설정
 set IDADIR=C:\Program Files\IDA Professional 9.3
+```
 
-# 3. 의존 패키지 설치
+#### Step 3. 의존 패키지 설치
+
+```bash
 pip install requests psutil
+```
 
-# 4. 환경 검증
+#### Step 4. 검증 및 초기화
+
+```bash
+# 환경 검증
 python tools/ida_cli.py --check
 
-# 5. 초기 설정 (디렉토리 생성)
+# 작업 디렉토리 생성
 python tools/ida_cli.py --init
 ```
 
-### 빠른 시작
+#### Step 5. 설정 (선택사항)
 
-```bash
-# 인스턴스 시작
-python tools/ida_cli.py start ./samples/target.so
-# Instance started: id=a1b2
-
-# 분석 완료 대기
-python tools/ida_cli.py wait a1b2
-
-# 함수 목록
-python tools/ida_cli.py functions --filter main
-
-# 디컴파일
-python tools/ida_cli.py decompile main --out /tmp/main.c
-
-# 문자열 검색
-python tools/ida_cli.py strings --filter "password" --out /tmp/strings.txt
-
-# 크로스 레퍼런스
-python tools/ida_cli.py xrefs 0x401000 --direction both
-
-# 종료
-python tools/ida_cli.py stop a1b2
-```
-
-### 사용 예시
-
-#### 1. 기본 분석 워크플로우
-
-```bash
-# 시작 및 대기
-python tools/ida_cli.py start ./malware.exe
-python tools/ida_cli.py wait a1b2
-
-# 개요 파악: 함수, 문자열, imports 확인
-python tools/ida_cli.py functions --count 20
-python tools/ida_cli.py strings --filter "http" --out /tmp/strings.txt
-python tools/ida_cli.py imports --out /tmp/imports.txt
-
-# 상세 분석: 의심 함수 디컴파일
-python tools/ida_cli.py decompile sub_401000 --out /tmp/sub_401000.c
-
-# 호출 흐름 추적
-python tools/ida_cli.py xrefs sub_401000 --direction both
-
-# 종료
-python tools/ida_cli.py stop a1b2
-```
-
-#### 2. 다중 인스턴스
-
-```bash
-# 두 바이너리 동시 분석
-python tools/ida_cli.py start ./client.exe
-python tools/ida_cli.py start ./server.exe
-
-# 실행 중인 인스턴스 목록
-python tools/ida_cli.py list
-# ID      PORT   BINARY        STATE
-# a1b2    13100  client.exe    ready
-# c3d4    13101  server.exe    ready
-
-# -b로 특정 인스턴스 지정 (바이너리 이름 힌트)
-python tools/ida_cli.py -b client functions --filter send
-python tools/ida_cli.py -b server functions --filter recv
-```
-
-#### 3. curl 직접 호출 (CLI 없이)
-
-```bash
-# auth_token 파일에서 토큰 추출
-TOKEN=$(grep a1b2 ~/.ida-headless/auth_token | cut -d: -f3)
-
-# JSON-RPC 직접 호출
-curl -s http://127.0.0.1:13100/jsonrpc \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"method\": \"decompile\", \"params\": {\"addr\": \"main\"}}"
-```
-
-#### 4. 일괄 디컴파일
-
-```bash
-# 패턴에 맞는 모든 함수 디컴파일
-for func in $(python tools/ida_cli.py functions --filter "sub_40" --json | jq -r '.[].name'); do
-    python tools/ida_cli.py decompile "$func" --out "/tmp/decompiled/${func}.c"
-done
-```
-
-#### 5. 스크립트 자동화 (Python)
-
-```python
-import subprocess, json
-
-def ida(cmd):
-    r = subprocess.run(["python", "tools/ida_cli.py"] + cmd + ["--json"],
-                       capture_output=True, text=True)
-    return json.loads(r.stdout)
-
-# 시작 및 분석
-ida(["start", "./target.so"])
-funcs = ida(["functions", "--filter", "decrypt"])
-for f in funcs:
-    code = ida(["decompile", f["name"]])
-    print(f"=== {f['name']} ===\n{code['pseudocode']}")
-```
-
-### 명령어
-
-#### 인스턴스 관리
-
-```bash
-ida_cli.py start   <binary> [--arch <arch>] [--fresh] [--force] [--idb-dir <path>]
-ida_cli.py stop    <id>
-ida_cli.py status  [<id>]
-ida_cli.py wait    <id> [--timeout 300]
-ida_cli.py list
-ida_cli.py logs    <id> [--tail N]
-ida_cli.py cleanup [--dry-run]
-```
-
-#### 분석
-
-```bash
-ida_cli.py functions    [--count N] [--filter STR] [--out FILE]
-ida_cli.py strings      [--count N] [--filter STR] [--out FILE]
-ida_cli.py imports      [--count N] [--out FILE]
-ida_cli.py exports      [--count N] [--out FILE]
-ida_cli.py segments     [--out FILE]
-ida_cli.py decompile    <addr|name> [--out FILE]
-ida_cli.py disasm       <addr|name> [--count N] [--out FILE]
-ida_cli.py xrefs        <addr> [--direction to|from|both] [--out FILE]
-ida_cli.py find_func    <name> [--regex] [--max N]
-ida_cli.py func_info    <addr|name>
-ida_cli.py imagebase
-ida_cli.py bytes        <addr> <size>
-ida_cli.py find_pattern <hex_pattern> [--max N]
-```
-
-#### 수정
-
-```bash
-ida_cli.py rename  <addr> <new_name>
-ida_cli.py comment <addr> "text" [--type func]
-ida_cli.py save
-```
-
-#### 글로벌 옵션
-
-| Option | Description |
-| ------ | ----------- |
-| `--json` | JSON 출력 모드 |
-| `-i <id>` | 인스턴스 ID 직접 지정 |
-| `-b <hint>` | 바이너리 이름 일부로 인스턴스 자동 선택 |
-| `--out FILE` | 결과를 파일로 저장 (컨텍스트 절약) |
-| `--idb-dir <path>` | IDB 저장 디렉토리 오버라이드 (start 전용) |
-
-### 프로젝트 구조
-
-```text
-tools/
-├── config.json      # 전역 설정 (경로, 분석 파라미터, 보안)
-├── common.py        # 공유 모듈 (config, registry, lock, file_md5)
-├── arch_detect.py   # 바이너리 헤더 파싱 (ELF, PE, Mach-O, FAT)
-├── ida_server.py    # idalib HTTP JSON-RPC 서버 (24개 API)
-└── ida_cli.py       # CLI 진입점 (인스턴스 관리 + 분석 프록시)
-```
-
-#### 런타임 파일
-
-```text
-%USERPROFILE%\.ida-headless\
-├── ida_servers.json       # 인스턴스 레지스트리
-├── auth_token             # 인증 토큰 (instance_id:port:token)
-├── idb\                   # IDB 파일 (.i64)
-└── logs\                  # 인스턴스 로그
-```
-
-### 설정
-
-`tools/config.json` 또는 `%USERPROFILE%\.ida-headless\config.json`에 설정:
+`tools/config.json`에서 IDA 경로 등 설정:
 
 ```json
 {
@@ -568,48 +291,101 @@ tools/
     "log_dir": "%USERPROFILE%/.ida-headless/logs"
   },
   "analysis": {
-    "max_instances": 3,
-    "open_db_timeout": 600,
-    "request_timeout": 35
-  },
-  "security": {
-    "exec_enabled": false
+    "max_instances": 3
   }
 }
 ```
 
-### 지원 포맷
-
-| Platform | Formats |
-| -------- | ------- |
-| Windows | PE32, PE64, .NET, DOS MZ |
-| Linux | ELF32, ELF64 |
-| macOS/iOS | Mach-O 32/64, FAT, dylib |
-| Android | ELF ARM/ARM64/x86, .so |
-| Firmware | Raw binary, Intel HEX, SREC |
-
-#### 디컴파일러 아키텍처
-
-| Architecture | 32-bit | 64-bit |
-| ------------ | ------ | ------ |
-| x86 | hexrays | hexx64 |
-| ARM | hexarm | hexarm64 |
-| MIPS | hexmips | hexmips64 |
-| PowerPC | hexppc | hexppc64 |
-| RISC-V | hexrv | hexrv64 |
-
-### Claude Code 연동
-
-Claude Code 스킬로 등록하여 `/ida <binary>` 명령으로 자동 분석을 시작할 수 있습니다.
+#### Step 6. 동작 테스트
 
 ```bash
-# .claude/commands/ida.md 스킬 파일 포함
-# 사용법: Claude Code에서 /ida ./target.so
+# 아무 바이너리로 인스턴스 시작
+python tools/ida_cli.py start ./samples/target.exe
+
+# 상태 확인
+python tools/ida_cli.py list
+
+# 종료
+python tools/ida_cli.py stop <id>
 ```
+
+`Instance started: id=xxxx`가 출력되고 `list`에 나타나면 환경 구축 완료.
+
+### AI 연동
+
+환경 구축 완료 후, AI 어시스턴트가 shell로 `ida_cli.py` 명령어를 호출합니다. 사용자가 명령어를 외울 필요 없습니다.
+
+#### Claude Code
+
+`.claude/commands/ida.md` 스킬 파일이 포함되어 있습니다:
+
+```text
+/ida ./target.so
+```
+
+Claude가 자동으로 인스턴스를 시작하고, 바이너리를 분석하고, 결과를 보고합니다.
+
+#### 다른 AI 도구 (Cursor, GPT 등)
+
+shell/터미널 접근이 가능한 AI면 `ida_cli.py`를 직접 호출할 수 있습니다. `CLAUDE.md`에 전체 명령어 레퍼런스가 있으므로 AI에게 참고하게 하면 됩니다.
+
+### 명령어 레퍼런스
+
+명령어는 주로 AI가 사용하며, 참고용으로 정리합니다.
+
+#### 인스턴스 관리
+
+| 명령어 | 설명 |
+| ------- | ---- |
+| `start <binary>` | 분석 인스턴스 시작 |
+| `stop <id>` | 인스턴스 종료 |
+| `wait <id>` | 분석 완료 대기 |
+| `list` | 실행 중인 인스턴스 목록 |
+| `status [<id>]` | 인스턴스 상태 확인 |
+| `logs <id>` | 인스턴스 로그 보기 |
+| `cleanup` | 비정상 인스턴스 정리 |
+
+#### 분석 (24개 API)
+
+| 명령어 | 설명 |
+| ------- | ---- |
+| `functions` | 함수 목록 |
+| `strings` | 문자열 목록 |
+| `imports` / `exports` | imports/exports 목록 |
+| `segments` | 세그먼트 목록 |
+| `decompile <addr\|name>` | 함수 디컴파일 |
+| `disasm <addr\|name>` | 디스어셈블 |
+| `xrefs <addr>` | 크로스 레퍼런스 |
+| `find_func <name>` | 함수 검색 |
+| `func_info <addr\|name>` | 함수 상세 정보 |
+| `bytes <addr> <size>` | Raw 바이트 읽기 |
+| `find_pattern <hex>` | 바이트 패턴 검색 |
+
+#### 수정
+
+| 명령어 | 설명 |
+| ------- | ---- |
+| `rename <addr> <name>` | 심볼 이름 변경 |
+| `comment <addr> "text"` | 주석 추가 |
+| `save` | 데이터베이스 저장 |
+
+#### 공통 옵션
+
+| 옵션 | 설명 |
+| ---- | ---- |
+| `--json` | JSON 출력 |
+| `-i <id>` | 인스턴스 ID 지정 |
+| `-b <hint>` | 바이너리 이름으로 자동 선택 |
+| `--out FILE` | 결과를 파일로 저장 |
+
+### 지원 포맷
+
+PE, ELF, Mach-O, FAT, .so, dylib, Raw binary, Intel HEX, SREC
+
+디컴파일러: x86/x64, ARM/ARM64, MIPS, PowerPC, RISC-V
 
 ### 라이선스
 
-이 프로젝트는 **Apache License 2.0**으로 배포됩니다. 자세한 내용은 [LICENSE](LICENSE)를 참조하세요.
+**Apache License 2.0** — [LICENSE](LICENSE) 참조.
 
-이 프로젝트를 사용하려면 별도로 유효한 **IDA Pro 라이선스**가 필요합니다.
-Hex-Rays 디컴파일러 라이선스는 선택 사항 (없으면 어셈블리 전용 모드).
+이 프로젝트를 사용하려면 별도로 유효한 **IDA Pro 라이선스**가 필요합니다. Hex-Rays 디컴파일러 라이선스는 선택 사항.
