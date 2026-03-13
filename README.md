@@ -34,6 +34,7 @@ This project intentionally uses plain HTTP JSON-RPC instead of MCP (Model Contex
 | **Transparency** | Raw JSON request/response visible in logs | Abstracted behind protocol layers |
 | **idalib constraint** | Single-thread `HTTPServer` maps 1:1 to idalib's requirement | MCP's async model conflicts with idalib's single-thread restriction |
 | **Context window** | Zero overhead — just bash commands | Tool schemas for all MCP methods loaded into AI context, consuming tokens |
+| **Script automation** | Directly callable from bash/Python scripts | Requires MCP client library |
 
 > **TL;DR** — For a tool that wraps a single-threaded native library (idalib), a simple HTTP server is more reliable and portable than MCP. Any AI assistant with bash/shell access can use it immediately.
 
@@ -257,6 +258,7 @@ User/Claude → ida_cli.py → HTTP JSON-RPC → ida_server.py (import idapro)
 | **투명성** | Raw JSON 요청/응답이 로그에 그대로 노출 | 프로토콜 레이어 뒤에 추상화됨 |
 | **idalib 제약** | 단일 스레드 `HTTPServer`가 idalib 제약과 1:1 매핑 | MCP의 async 모델이 idalib 단일 스레드 제약과 충돌 |
 | **컨텍스트 윈도우** | 오버헤드 없음 — bash 명령어만 사용 | 모든 MCP 메서드의 tool schema가 AI 컨텍스트에 로드되어 토큰 소모 |
+| **스크립트 자동화** | bash/Python 스크립트에서 바로 호출 가능 | MCP 클라이언트 라이브러리 필요 |
 
 > **요약** — 단일 스레드 네이티브 라이브러리(idalib)를 감싸는 도구에는 MCP보다 단순한 HTTP 서버가 더 안정적이고 이식성이 높습니다. bash/shell 접근이 가능한 모든 AI 어시스턴트에서 즉시 사용할 수 있습니다.
 
