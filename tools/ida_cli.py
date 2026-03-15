@@ -2079,6 +2079,275 @@ def cmd_compare(args, config, config_path):
         _save_local(out_path, json.dumps(report, ensure_ascii=False, indent=2))
 
 
+# ─────────────────────────────────────────────
+# Enums
+# ─────────────────────────────────────────────
+
+def cmd_enums(args, config):
+    """Manage enums."""
+    action = getattr(args, 'action', 'list')
+
+    if action == "list":
+        p = {}
+        if getattr(args, 'filter', None):
+            p["filter"] = args.filter
+        r = _rpc_call(args, config, "list_enums", p)
+        if not r:
+            return
+        print(f"  Total: {r.get('total', 0)}")
+        for e in r.get("enums", []):
+            print(f"    {e['name']:<30}  members={e['member_count']}")
+
+    elif action == "show":
+        r = _rpc_call(args, config, "get_enum", {"name": args.name})
+        if not r:
+            return
+        print(f"  enum {r['name']} ({r['total']} members)")
+        for m in r.get("members", []):
+            print(f"    {m['name']:<30} = {m['value']}")
+
+    elif action == "create":
+        p = {"name": args.name}
+        members = []
+        for mdef in (getattr(args, 'members', None) or []):
+            parts = mdef.split("=")
+            mname = parts[0].strip()
+            mval = parts[1].strip() if len(parts) > 1 else ""
+            members.append({"name": mname, "value": mval})
+        if members:
+            p["members"] = members
+        r = _rpc_call(args, config, "create_enum", p)
+        if not r:
+            return
+        print(f"  [+] Enum created: {args.name} (members: {r.get('members_added', 0)})")
+
+
+# ─────────────────────────────────────────────
+# Pseudocode Search
+# ─────────────────────────────────────────────
+
+def cmd_search_code(args, config):
+    """Search within decompiled pseudocode."""
+    p = {"query": args.query}
+    if getattr(args, 'max', None):
+        p["max_results"] = args.max
+    if getattr(args, 'max_funcs', None):
+        p["max_funcs"] = args.max_funcs
+    if getattr(args, 'case_sensitive', False):
+        p["case_sensitive"] = True
+    r = _rpc_call(args, config, "search_code", p)
+    if not r:
+        return
+    print(f"  Query: \"{r.get('query', '')}\"  Found: {r.get('total', 0)} functions  (scanned: {r.get('functions_scanned', 0)})")
+    for entry in r.get("results", []):
+        print(f"\n    {entry['addr']}  {entry['name']}")
+        for m in entry.get("matches", []):
+            print(f"      L{m['line_num']}: {m['text']}")
+
+
+# ─────────────────────────────────────────────
+# Code-level Diff
+# ─────────────────────────────────────────────
+
+def cmd_code_diff(args, config):
+    """Compare decompiled code of same-named functions between two instances."""
+    import difflib
+
+    id_a = args.instance_a
+    id_b = args.instance_b
+    func_names = getattr(args, 'functions', None) or []
+
+    registry = load_registry()
+
+    def resolve(hint):
+        for iid, info in registry.items():
+            binary = os.path.basename(info.get("binary", ""))
+            if hint.lower() in binary.lower() or hint == iid:
+                return iid, info
+        print(f"[-] Cannot resolve: {hint}")
+        return None, None
+
+    iid_a, info_a = resolve(id_a)
+    if not iid_a:
+        return
+    iid_b, info_b = resolve(id_b)
+    if not iid_b:
+        return
+
+    port_a = info_a.get("port")
+    port_b = info_b.get("port")
+
+    if not func_names:
+        # Get common functions, find size-changed ones
+        resp_a = post_rpc(config, port_a, "get_functions", iid_a, {"count": 10000})
+        resp_b = post_rpc(config, port_b, "get_functions", iid_b, {"count": 10000})
+        if "error" in resp_a or "error" in resp_b:
+            print("[-] Cannot get function lists")
+            return
+        funcs_a = {f["name"]: f for f in resp_a.get("result", {}).get("data", [])}
+        funcs_b = {f["name"]: f for f in resp_b.get("result", {}).get("data", [])}
+        common = set(funcs_a.keys()) & set(funcs_b.keys())
+        changed = []
+        for name in common:
+            if funcs_a[name].get("size", 0) != funcs_b[name].get("size", 0):
+                changed.append(name)
+        changed.sort()
+        func_names = changed[:10]
+        print(f"  Auto-selected {len(func_names)} size-changed functions from {len(changed)} total")
+
+    out_path = getattr(args, 'out', None)
+    all_diffs = []
+    bin_a = os.path.basename(info_a.get("binary", "?"))
+    bin_b = os.path.basename(info_b.get("binary", "?"))
+
+    for name in func_names:
+        resp_a = post_rpc(config, port_a, "decompile_diff", iid_a, {"addr": name})
+        resp_b = post_rpc(config, port_b, "decompile_diff", iid_b, {"addr": name})
+        if "error" in resp_a or "error" in resp_b:
+            print(f"  [-] Cannot decompile: {name}")
+            continue
+        code_a = resp_a.get("result", {}).get("code", "")
+        code_b = resp_b.get("result", {}).get("code", "")
+        if code_a == code_b:
+            continue
+
+        diff = list(difflib.unified_diff(
+            code_a.splitlines(), code_b.splitlines(),
+            fromfile=f"{bin_a}:{name}",
+            tofile=f"{bin_b}:{name}",
+            lineterm="",
+        ))
+        if diff:
+            all_diffs.append({"name": name, "diff": diff})
+            print(f"\n  === {name} ===")
+            for line in diff:
+                print(f"  {line}")
+
+    if not all_diffs:
+        print("  No code differences found")
+
+    if out_path and all_diffs:
+        content = []
+        for d in all_diffs:
+            content.append(f"=== {d['name']} ===")
+            content.extend(d["diff"])
+            content.append("")
+        _save_local(out_path, "\n".join(content))
+
+
+# ─────────────────────────────────────────────
+# Auto-rename
+# ─────────────────────────────────────────────
+
+def cmd_auto_rename(args, config):
+    """Heuristic auto-rename sub_ functions."""
+    dry_run = not getattr(args, 'apply', False)
+    max_funcs = getattr(args, 'max_funcs', 200) or 200
+    p = {"dry_run": dry_run, "max_funcs": max_funcs}
+    r = _rpc_call(args, config, "auto_rename", p)
+    if not r:
+        return
+    mode = "DRY RUN" if dry_run else "APPLIED"
+    print(f"  [{mode}] {r.get('total', 0)} renames suggested")
+    for entry in r.get("renames", [])[:50]:
+        print(f"    {entry['addr']}  {entry['old_name']} -> {entry['new_name']}")
+    if r.get("total", 0) > 50:
+        print(f"    ... and {r['total'] - 50} more")
+    if dry_run and r.get("total", 0) > 0:
+        print(f"\n  Use --apply to actually rename")
+
+
+# ─────────────────────────────────────────────
+# Export IDAPython Script
+# ─────────────────────────────────────────────
+
+def cmd_export_script(args, config):
+    """Generate IDAPython script from analysis modifications."""
+    out_path = getattr(args, 'output', 'analysis.py') or 'analysis.py'
+    p = {"output": out_path}
+    r = _rpc_call(args, config, "export_script", p)
+    if not r:
+        return
+    print(f"  Renames:  {r.get('renames', 0)}")
+    print(f"  Comments: {r.get('comments', 0)}")
+    print(f"  Types:    {r.get('types', 0)}")
+    if r.get("saved_to"):
+        print(f"  Saved to: {r['saved_to']}")
+
+
+# ─────────────────────────────────────────────
+# VTable Detection
+# ─────────────────────────────────────────────
+
+def cmd_vtables(args, config):
+    """Detect virtual function tables."""
+    p = {}
+    if getattr(args, 'max', None):
+        p["max_results"] = args.max
+    if getattr(args, 'min_entries', None):
+        p["min_entries"] = args.min_entries
+    r = _rpc_call(args, config, "detect_vtables", p)
+    if not r:
+        return
+    print(f"  Detected: {r.get('total', 0)} vtables (ptr_size={r.get('ptr_size', 8)})")
+    for vt in r.get("vtables", []):
+        print(f"\n    {vt['addr']}  ({vt['entries']} entries)")
+        for fn in vt.get("functions", [])[:10]:
+            print(f"      +{fn['offset']:<4}  {fn['addr']}  {fn['name']}")
+        if vt["entries"] > 10:
+            print(f"      ... ({vt['entries'] - 10} more)")
+
+
+# ─────────────────────────────────────────────
+# Project-local Config
+# ─────────────────────────────────────────────
+
+def _merge_project_config(config):
+    """Merge project-local config.local.json if present."""
+    local_path = os.path.join(os.getcwd(), "config.local.json")
+    if not os.path.isfile(local_path):
+        return config
+    try:
+        with open(local_path, "r", encoding="utf-8") as f:
+            local = json.load(f)
+        # Deep merge
+        merged = dict(config)
+        for key, val in local.items():
+            if key in merged and isinstance(merged[key], dict) and isinstance(val, dict):
+                merged[key] = {**merged[key], **val}
+            else:
+                merged[key] = val
+        return merged
+    except Exception:
+        return config
+
+
+# ─────────────────────────────────────────────
+# FLIRT Signatures
+# ─────────────────────────────────────────────
+
+def cmd_sigs(args, config):
+    """Manage FLIRT signatures."""
+    action = getattr(args, 'action', 'list')
+
+    if action == "list":
+        r = _rpc_call(args, config, "list_sigs")
+        if not r:
+            return
+        print(f"  Sig dir: {r.get('sig_dir', '')}")
+        print(f"  Total: {r.get('total', 0)}")
+        for s in r.get("signatures", []):
+            size_kb = s.get("size", 0) / 1024
+            print(f"    {s['name']:<40}  {size_kb:.1f}KB")
+
+    elif action == "apply":
+        sig_name = args.sig_name
+        r = _rpc_call(args, config, "apply_sig", {"name": sig_name})
+        if not r:
+            return
+        print(f"  [+] Applied signature: {sig_name}")
+
+
 def cmd_update(args):
     """Self-update from git repository."""
     repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -2209,6 +2478,13 @@ def _build_dispatch(args, config, config_path):
         "structs": lambda: cmd_structs(args, config),
         "snapshot": lambda: cmd_snapshot(args, config),
         "compare": lambda: cmd_compare(args, config, config_path),
+        "enums": lambda: cmd_enums(args, config),
+        "search-code": lambda: cmd_search_code(args, config),
+        "code-diff": lambda: cmd_code_diff(args, config),
+        "auto-rename": lambda: cmd_auto_rename(args, config),
+        "export-script": lambda: cmd_export_script(args, config),
+        "vtables": lambda: cmd_vtables(args, config),
+        "sigs": lambda: cmd_sigs(args, config),
         "update": lambda: cmd_update(args),
         "completions": lambda: cmd_completions(args),
     }
@@ -2421,6 +2697,45 @@ def main():
     p.add_argument("--idb-dir", default=None)
     p.add_argument("--out", default=None, help="Save diff report as JSON")
 
+    enu = sub.add_parser("enums", help="Manage enums", parents=[common])
+    enu_sub = enu.add_subparsers(dest="action")
+    enu_list = enu_sub.add_parser("list", help="List enums")
+    enu_list.add_argument("--filter", default=None)
+    enu_show = enu_sub.add_parser("show", help="Show enum details")
+    enu_show.add_argument("name", help="Enum name")
+    enu_create = enu_sub.add_parser("create", help="Create enum")
+    enu_create.add_argument("name", help="Enum name")
+    enu_create.add_argument("--members", nargs="*", help="Members as name=value (e.g. OK=0 ERR=1)")
+
+    p = sub.add_parser("search-code", help="Search in decompiled pseudocode", parents=[common])
+    p.add_argument("query", help="Search string")
+    p.add_argument("--max", type=int, default=None, help="Max results")
+    p.add_argument("--max-funcs", type=int, default=None, help="Max functions to scan")
+    p.add_argument("--case-sensitive", action="store_true")
+
+    p = sub.add_parser("code-diff", help="Diff decompiled code between instances", parents=[common])
+    p.add_argument("instance_a", help="Instance ID or binary hint")
+    p.add_argument("instance_b", help="Instance ID or binary hint")
+    p.add_argument("--functions", nargs="*", default=None, help="Function names to compare")
+    p.add_argument("--out", default=None, help="Save diff output")
+
+    p = sub.add_parser("auto-rename", help="Heuristic auto-rename sub_ functions", parents=[common])
+    p.add_argument("--apply", action="store_true", help="Actually apply renames (default: dry run)")
+    p.add_argument("--max-funcs", type=int, default=200)
+
+    p = sub.add_parser("export-script", help="Generate IDAPython script", parents=[common])
+    p.add_argument("--output", default="analysis.py", help="Output .py file")
+
+    p = sub.add_parser("vtables", help="Detect virtual function tables", parents=[common])
+    p.add_argument("--max", type=int, default=None)
+    p.add_argument("--min-entries", type=int, default=3, help="Minimum entries to qualify as vtable")
+
+    sig = sub.add_parser("sigs", help="FLIRT signatures", parents=[common])
+    sig_sub = sig.add_subparsers(dest="action")
+    sig_sub.add_parser("list", help="List available signatures")
+    sig_apply = sig_sub.add_parser("apply", help="Apply signature")
+    sig_apply.add_argument("sig_name", help="Signature name")
+
     sub.add_parser("update", help="Self-update from git")
 
     p = sub.add_parser("completions", help="Generate shell completions")
@@ -2429,6 +2744,7 @@ def main():
     args = parser.parse_args()
 
     config, config_path = load_config(args.config)
+    config = _merge_project_config(config)
     init_registry_paths(config)
 
     if args.init:

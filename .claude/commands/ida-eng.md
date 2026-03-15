@@ -99,10 +99,24 @@ ida-cli -b <hint> search-const 0x1234 --max 20
 ida-cli -b <hint> callgraph <addr|name> --depth 3 --direction callees
 ida-cli -b <hint> callgraph <addr> --format dot --out graph.dot
 
-# Struct management
+# Search in decompiled pseudocode
+ida-cli -b <hint> search-code "LoadString" --max 10
+ida-cli -b <hint> search-code "memcpy" --max-funcs 1000
+
+# Struct/enum management
 ida-cli -b <hint> structs list [--filter name]
 ida-cli -b <hint> structs show <struct_name>
 ida-cli -b <hint> structs create <name> --members "field1:4" "field2:8"
+ida-cli -b <hint> enums list [--filter name]
+ida-cli -b <hint> enums show <enum_name>
+ida-cli -b <hint> enums create <name> --members "OK=0" "ERR=1"
+
+# VTable detection
+ida-cli -b <hint> vtables [--min-entries 3]
+
+# FLIRT signatures
+ida-cli -b <hint> sigs list
+ida-cli -b <hint> sigs apply <sig_name>
 
 # Interactive IDA Python shell
 ida-cli -b <hint> shell
@@ -117,6 +131,7 @@ ida-cli -b <hint> rename <addr> <new_name>
 ida-cli -b <hint> set_type <addr> "int __fastcall func(int a, int b)"
 ida-cli -b <hint> patch <addr> 90 90 90  # NOP patch
 ida-cli -b <hint> comment <addr> "description text"
+ida-cli -b <hint> auto-rename [--apply] [--max-funcs 200]  # heuristic rename sub_ functions
 ida-cli -b <hint> save
 ```
 > **Iterative analysis pattern**: After applying rename/set_type, decompile again —
@@ -135,12 +150,18 @@ ida-cli -b <hint> annotations import analysis.json
 ida-cli -b <hint> snapshot save --description "before refactoring"
 ida-cli -b <hint> snapshot list
 ida-cli -b <hint> snapshot restore <snapshot_file>
+
+# Generate IDAPython script (reproducible analysis)
+ida-cli -b <hint> export-script --output analysis.py
 ```
 
 ### 7. Binary Comparison (Patch Diffing)
 ```bash
 # Compare two versions of a binary
 ida-cli -b <hint> compare old_binary.exe new_binary.exe --out diff.json
+
+# Code-level diff (decompiled pseudocode)
+ida-cli -b <hint> code-diff <instance_a> <instance_b> [--functions func1 func2]
 ```
 
 ### 8. Shutdown

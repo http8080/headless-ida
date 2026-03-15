@@ -1232,6 +1232,434 @@ def _handle_snapshot_restore(params):
     }
 
 
+# ─────────────────────────────────────────────
+# Enum management
+# ─────────────────────────────────────────────
+
+def _handle_list_enums(params):
+    """List all enums in the type library."""
+    import ida_typeinf
+    filt = params.get("filter", "")
+    til = ida_typeinf.get_idati()
+    enums = []
+    qty = ida_typeinf.get_ordinal_count(til)
+    for ordinal in range(1, qty):
+        tif = ida_typeinf.tinfo_t()
+        if tif.get_numbered_type(til, ordinal):
+            if tif.is_enum():
+                name = tif.get_type_name()
+                if not name:
+                    continue
+                if filt and filt.lower() not in name.lower():
+                    continue
+                enums.append({
+                    "ordinal": ordinal,
+                    "name": name,
+                    "member_count": tif.get_enum_nmembers(),
+                })
+    return {"total": len(enums), "enums": enums}
+
+
+def _handle_get_enum(params):
+    """Get enum details with members."""
+    import ida_typeinf
+    name = params.get("name")
+    if not name:
+        raise RpcError("INVALID_PARAMS", "name parameter required")
+    tif = ida_typeinf.tinfo_t()
+    if not tif.get_named_type(ida_typeinf.get_idati(), name):
+        raise RpcError("ENUM_NOT_FOUND", f"Enum not found: {name}")
+    if not tif.is_enum():
+        raise RpcError("NOT_AN_ENUM", f"{name} is not an enum")
+    members = []
+    edt = ida_typeinf.enum_type_data_t()
+    if tif.get_enum_details(edt):
+        for i in range(edt.size()):
+            m = edt[i]
+            members.append({"name": m.name, "value": m.value})
+    return {"name": name, "members": members, "total": len(members)}
+
+
+def _handle_create_enum(params):
+    """Create a new enum via type declaration."""
+    import ida_typeinf
+    name = params.get("name")
+    if not name:
+        raise RpcError("INVALID_PARAMS", "name parameter required")
+    members = params.get("members", [])
+    if members:
+        fields = []
+        for m in members:
+            mname = m.get("name", "")
+            mval = m.get("value", "")
+            if mval != "":
+                fields.append(f"  {mname} = {mval}")
+            else:
+                fields.append(f"  {mname}")
+        body = ",\n".join(fields)
+        decl = f"enum {name} {{\n{body}\n}};"
+    else:
+        decl = f"enum {name} {{ __placeholder }};"
+    result = ida_typeinf.idc_parse_types(decl, 0)
+    if result != 0:
+        raise RpcError("CREATE_ENUM_FAILED", f"Cannot create enum: {decl}")
+    if _config["analysis"]["auto_save"]:
+        save_db()
+    return {"ok": True, "name": name, "members_added": len(members)}
+
+
+# ─────────────────────────────────────────────
+# Pseudocode search
+# ─────────────────────────────────────────────
+
+def _handle_search_code(params):
+    """Search for a string within decompiled pseudocode."""
+    if not _decompiler_available:
+        raise RpcError("DECOMPILER_NOT_LOADED", "Decompiler plugin not available")
+    import ida_hexrays, idc, idautils, ida_funcs
+    query = params.get("query")
+    if not query:
+        raise RpcError("INVALID_PARAMS", "query parameter required")
+    case_sensitive = params.get("case_sensitive", False)
+    max_results = min(int(params.get("max_results", 20)), 100)
+    max_funcs = min(int(params.get("max_funcs", 500)), 2000)
+
+    if not case_sensitive:
+        query_lower = query.lower()
+
+    results = []
+    func_count = 0
+    for ea in idautils.Functions():
+        if func_count >= max_funcs or len(results) >= max_results:
+            break
+        func_count += 1
+        func = ida_funcs.get_func(ea)
+        if not func:
+            continue
+        try:
+            cfunc = ida_hexrays.decompile(func.start_ea)
+            if not cfunc:
+                continue
+            code = str(cfunc)
+        except Exception:
+            continue
+        if case_sensitive:
+            match = query in code
+        else:
+            match = query_lower in code.lower()
+        if match:
+            name = idc.get_func_name(func.start_ea) or ""
+            # Find matching lines
+            matching_lines = []
+            for i, line in enumerate(code.split("\n")):
+                if case_sensitive:
+                    if query in line:
+                        matching_lines.append({"line_num": i + 1, "text": line.strip()})
+                else:
+                    if query_lower in line.lower():
+                        matching_lines.append({"line_num": i + 1, "text": line.strip()})
+            results.append({
+                "addr": _fmt_addr(func.start_ea),
+                "name": name,
+                "matches": matching_lines[:5],  # max 5 lines per function
+            })
+    saved_to = _save_output(params.get("output"), results, fmt="json")
+    return {
+        "query": query,
+        "total": len(results),
+        "functions_scanned": func_count,
+        "results": results,
+        "saved_to": saved_to,
+    }
+
+
+# ─────────────────────────────────────────────
+# Code-level diff (decompile diff)
+# ─────────────────────────────────────────────
+
+def _handle_decompile_diff(params):
+    """Decompile a function and return code for diffing."""
+    if not _decompiler_available:
+        raise RpcError("DECOMPILER_NOT_LOADED", "Decompiler not available")
+    import ida_hexrays, idc, ida_funcs
+    ea = _resolve_addr(params.get("addr"))
+    func = ida_funcs.get_func(ea)
+    if not func:
+        raise RpcError("NOT_A_FUNCTION", f"No function at {_fmt_addr(ea)}")
+    try:
+        cfunc = ida_hexrays.decompile(func.start_ea)
+        code = str(cfunc) if cfunc else ""
+    except Exception as e:
+        code = f"// Decompile failed: {e}"
+    name = idc.get_func_name(func.start_ea) or ""
+    size = func.end_ea - func.start_ea
+    return {"addr": _fmt_addr(func.start_ea), "name": name, "size": size, "code": code}
+
+
+# ─────────────────────────────────────────────
+# Auto-rename (heuristic)
+# ─────────────────────────────────────────────
+
+def _handle_auto_rename(params):
+    """Heuristic-based automatic function renaming."""
+    import idc, idautils, ida_funcs, ida_xref
+    max_funcs = min(int(params.get("max_funcs", 200)), 1000)
+    dry_run = params.get("dry_run", True)
+
+    renames = []
+    count = 0
+    for ea in idautils.Functions():
+        if count >= max_funcs:
+            break
+        name = idc.get_func_name(ea)
+        if not name or not name.startswith("sub_"):
+            continue
+        count += 1
+        func = ida_funcs.get_func(ea)
+        if not func:
+            continue
+
+        suggested = None
+
+        # Strategy 1: String reference based naming
+        for item_ea in idautils.FuncItems(ea):
+            for xref in idautils.DataRefsFrom(item_ea):
+                s = idc.get_strlit_contents(xref)
+                if s and len(s) >= 4:
+                    try:
+                        s = s.decode("utf-8", errors="ignore")
+                    except Exception:
+                        s = str(s)
+                    # Clean string for function name
+                    clean = ""
+                    for ch in s[:40]:
+                        if ch.isalnum() or ch == '_':
+                            clean += ch
+                        elif ch in (' ', '-', '.', '/'):
+                            clean += '_'
+                    clean = clean.strip('_')
+                    if clean and len(clean) >= 3 and not clean[0].isdigit():
+                        suggested = f"fn_{clean}"
+                        break
+            if suggested:
+                break
+
+        # Strategy 2: API call based naming
+        if not suggested:
+            api_calls = []
+            for item_ea in idautils.FuncItems(ea):
+                for xref in idautils.XrefsFrom(item_ea):
+                    target_name = idc.get_func_name(xref.to)
+                    if target_name and not target_name.startswith("sub_") and not target_name.startswith("nullsub_"):
+                        if xref.type in (ida_xref.fl_CF, ida_xref.fl_CN):
+                            api_calls.append(target_name)
+            if api_calls:
+                # Use the most distinctive API call
+                for api in api_calls:
+                    # Skip common runtime functions
+                    if api in ("__security_check_cookie", "memset_0", "_guard_dispatch_icall"):
+                        continue
+                    clean = api.split("@")[0].lstrip("?_")
+                    if clean and len(clean) >= 3:
+                        suggested = f"calls_{clean[:30]}"
+                        break
+
+        if suggested:
+            # Ensure unique
+            if idc.get_name_ea_simple(suggested) != idc.BADADDR:
+                suggested = f"{suggested}_{_fmt_addr(ea).replace('0x', '')}"
+            renames.append({
+                "addr": _fmt_addr(ea),
+                "old_name": name,
+                "new_name": suggested,
+            })
+            if not dry_run:
+                idc.set_name(ea, suggested, idc.SN_NOWARN | idc.SN_NOCHECK)
+
+    if not dry_run and renames and _config["analysis"]["auto_save"]:
+        save_db()
+    return {"total": len(renames), "dry_run": dry_run, "renames": renames}
+
+
+# ─────────────────────────────────────────────
+# Generate IDAPython script from modifications
+# ─────────────────────────────────────────────
+
+def _handle_export_script(params):
+    """Generate reproducible IDAPython script from analysis."""
+    import idc, idautils, ida_funcs, ida_nalt
+    lines = [
+        "#!/usr/bin/env python3",
+        '"""Auto-generated IDAPython script from ida-cli analysis."""',
+        "import idc",
+        "import ida_typeinf",
+        "",
+    ]
+    _auto_prefixes = ("sub_", "nullsub_", "loc_", "unk_", "byte_", "word_",
+                      "dword_", "qword_", "off_", "stru_", "asc_")
+    # Renames
+    rename_count = 0
+    for ea in idautils.Functions():
+        name = idc.get_func_name(ea)
+        if name and not any(name.startswith(p) for p in _auto_prefixes):
+            lines.append(f'idc.set_name({_fmt_addr(ea)}, "{name}", idc.SN_NOWARN)')
+            rename_count += 1
+    for item in idautils.Names():
+        ea, name = item[0], item[1]
+        if not any(name.startswith(p) for p in _auto_prefixes):
+            func = ida_funcs.get_func(ea)
+            if not func:
+                lines.append(f'idc.set_name({_fmt_addr(ea)}, "{name}", idc.SN_NOWARN)')
+                rename_count += 1
+    lines.append("")
+
+    # Comments
+    comment_count = 0
+    for ea in idautils.Functions():
+        cmt = idc.get_cmt(ea, False)
+        rcmt = idc.get_cmt(ea, True)
+        fcmt = idc.get_func_cmt(ea, False)
+        if cmt:
+            lines.append(f'idc.set_cmt({_fmt_addr(ea)}, {repr(cmt)}, False)')
+            comment_count += 1
+        if rcmt:
+            lines.append(f'idc.set_cmt({_fmt_addr(ea)}, {repr(rcmt)}, True)')
+            comment_count += 1
+        if fcmt:
+            lines.append(f'idc.set_func_cmt({_fmt_addr(ea)}, {repr(fcmt)}, False)')
+            comment_count += 1
+    lines.append("")
+
+    # Types
+    type_count = 0
+    for ea in idautils.Functions():
+        type_str = idc.get_type(ea)
+        if type_str:
+            lines.append(f'idc.SetType({_fmt_addr(ea)}, "{type_str}")')
+            type_count += 1
+
+    lines.append("")
+    lines.append(f'print(f"Applied {{renames}} renames, {{comments}} comments, {{types}} types")')
+    lines.append(f'renames = {rename_count}')
+    lines.append(f'comments = {comment_count}')
+    lines.append(f'types = {type_count}')
+
+    script = "\n".join(lines)
+    saved_to = _save_output(params.get("output"), script)
+    return {"renames": rename_count, "comments": comment_count, "types": type_count, "saved_to": saved_to}
+
+
+# ─────────────────────────────────────────────
+# VTable detection
+# ─────────────────────────────────────────────
+
+def _handle_detect_vtables(params):
+    """Detect virtual function tables in data segments."""
+    import idc, idautils, ida_funcs, ida_bytes, ida_segment
+    max_results = min(int(params.get("max_results", 50)), 200)
+    min_entries = int(params.get("min_entries", 3))
+    ptr_size = 8 if idc.get_inf_attr(idc.INF_LFLAGS) & 1 else 4  # 64-bit check
+
+    vtables = []
+    for seg_ea in idautils.Segments():
+        seg = ida_segment.getseg(seg_ea)
+        if not seg:
+            continue
+        # Only scan data segments (not code)
+        perm = seg.perm
+        if perm & SEGPERM_EXEC:
+            continue
+        ea = seg.start_ea
+        while ea < seg.end_ea and len(vtables) < max_results:
+            # Read pointer
+            if ptr_size == 8:
+                val = ida_bytes.get_qword(ea)
+            else:
+                val = ida_bytes.get_dword(ea)
+            # Check if it points to a function
+            if val and ida_funcs.get_func(val):
+                # Count consecutive function pointers
+                entries = []
+                check_ea = ea
+                while check_ea < seg.end_ea:
+                    if ptr_size == 8:
+                        ptr_val = ida_bytes.get_qword(check_ea)
+                    else:
+                        ptr_val = ida_bytes.get_dword(check_ea)
+                    if ptr_val and ida_funcs.get_func(ptr_val):
+                        entries.append({
+                            "offset": check_ea - ea,
+                            "addr": _fmt_addr(ptr_val),
+                            "name": idc.get_func_name(ptr_val) or "",
+                        })
+                        check_ea += ptr_size
+                    else:
+                        break
+                if len(entries) >= min_entries:
+                    vtables.append({
+                        "addr": _fmt_addr(ea),
+                        "entries": len(entries),
+                        "functions": entries[:20],  # limit detail
+                    })
+                    ea = check_ea  # skip past this vtable
+                    continue
+            ea += ptr_size
+    return {"total": len(vtables), "ptr_size": ptr_size, "vtables": vtables}
+
+
+# ─────────────────────────────────────────────
+# Apply FLIRT signature
+# ─────────────────────────────────────────────
+
+def _handle_apply_sig(params):
+    """Apply FLIRT signature file."""
+    import ida_funcs, idc, idautils
+    sig_name = params.get("name")
+    if not sig_name:
+        raise RpcError("INVALID_PARAMS", "name parameter required (signature name without .sig)")
+    try:
+        import ida_sigmake
+    except ImportError:
+        pass
+    # Use plan_to_apply_idasgn
+    import ida_funcs as _idf
+    try:
+        result = _idf.plan_to_apply_idasgn(sig_name)
+        # Count functions before/after
+        return {"ok": True, "signature": sig_name, "result": result}
+    except Exception as e:
+        raise RpcError("APPLY_SIG_FAILED", f"Cannot apply signature: {e}")
+
+
+def _handle_list_sigs(params):
+    """List available FLIRT signature files."""
+    import ida_diskio
+    sig_dir = ida_diskio.idadir("sig")
+    sigs = []
+    if os.path.isdir(sig_dir):
+        for f in sorted(os.listdir(sig_dir)):
+            if f.endswith(".sig"):
+                fpath = os.path.join(sig_dir, f)
+                sigs.append({
+                    "name": f[:-4],
+                    "filename": f,
+                    "size": os.path.getsize(fpath),
+                })
+        # Also check architecture subdirs
+        for sub in os.listdir(sig_dir):
+            sub_path = os.path.join(sig_dir, sub)
+            if os.path.isdir(sub_path):
+                for f in sorted(os.listdir(sub_path)):
+                    if f.endswith(".sig"):
+                        fpath = os.path.join(sub_path, f)
+                        sigs.append({
+                            "name": f"{sub}/{f[:-4]}",
+                            "filename": f,
+                            "size": os.path.getsize(fpath),
+                        })
+    return {"total": len(sigs), "sig_dir": sig_dir, "signatures": sigs}
+
+
 def _handle_exec(params):
     if not _config["security"]["exec_enabled"]:
         raise RpcError("EXEC_DISABLED",
@@ -1299,6 +1727,16 @@ _METHODS = {
     "snapshot_save": _handle_snapshot_save,
     "snapshot_list": _handle_snapshot_list,
     "snapshot_restore": _handle_snapshot_restore,
+    "list_enums": _handle_list_enums,
+    "get_enum": _handle_get_enum,
+    "create_enum": _handle_create_enum,
+    "search_code": _handle_search_code,
+    "decompile_diff": _handle_decompile_diff,
+    "auto_rename": _handle_auto_rename,
+    "export_script": _handle_export_script,
+    "detect_vtables": _handle_detect_vtables,
+    "apply_sig": _handle_apply_sig,
+    "list_sigs": _handle_list_sigs,
 }
 
 _METHOD_DESCRIPTIONS = [
@@ -1340,6 +1778,16 @@ _METHOD_DESCRIPTIONS = [
     ("snapshot_save", "Save IDB snapshot"),
     ("snapshot_list", "List snapshots"),
     ("snapshot_restore", "Restore IDB from snapshot"),
+    ("list_enums", "List enums"),
+    ("get_enum", "Get enum details"),
+    ("create_enum", "Create a new enum"),
+    ("search_code", "Search within decompiled pseudocode"),
+    ("decompile_diff", "Decompile function for diffing"),
+    ("auto_rename", "Heuristic auto-rename sub_ functions"),
+    ("export_script", "Generate IDAPython script from analysis"),
+    ("detect_vtables", "Detect virtual function tables"),
+    ("apply_sig", "Apply FLIRT signature"),
+    ("list_sigs", "List available FLIRT signatures"),
 ]
 
 

@@ -99,10 +99,24 @@ ida-cli -b <hint> search-const 0x1234 --max 20
 ida-cli -b <hint> callgraph <주소|이름> --depth 3 --direction callees
 ida-cli -b <hint> callgraph <주소> --format dot --out graph.dot
 
-# 구조체 관리
+# 디컴파일 결과 내 검색
+ida-cli -b <hint> search-code "LoadString" --max 10
+ida-cli -b <hint> search-code "memcpy" --max-funcs 1000
+
+# 구조체/열거형 관리
 ida-cli -b <hint> structs list [--filter 이름]
 ida-cli -b <hint> structs show <구조체_이름>
 ida-cli -b <hint> structs create <이름> --members "field1:4" "field2:8"
+ida-cli -b <hint> enums list [--filter 이름]
+ida-cli -b <hint> enums show <열거형_이름>
+ida-cli -b <hint> enums create <이름> --members "OK=0" "ERR=1"
+
+# VTable 탐지
+ida-cli -b <hint> vtables [--min-entries 3]
+
+# FLIRT 시그니처
+ida-cli -b <hint> sigs list
+ida-cli -b <hint> sigs apply <시그니처_이름>
 
 # 대화형 IDA Python 셸
 ida-cli -b <hint> shell
@@ -117,6 +131,7 @@ ida-cli -b <hint> rename <주소> <새이름>
 ida-cli -b <hint> set_type <주소> "int __fastcall func(int a, int b)"
 ida-cli -b <hint> patch <주소> 90 90 90  # NOP 패치
 ida-cli -b <hint> comment <주소> "설명 텍스트"
+ida-cli -b <hint> auto-rename [--apply] [--max-funcs 200]  # sub_ 함수 휴리스틱 이름 추정
 ida-cli -b <hint> save
 ```
 > **반복 분석 패턴**: rename/set_type 적용 후 다시 decompile하면 변수명과 타입이
@@ -134,12 +149,18 @@ ida-cli -b <hint> annotations import analysis.json
 ida-cli -b <hint> snapshot save --description "리팩토링 전"
 ida-cli -b <hint> snapshot list
 ida-cli -b <hint> snapshot restore <스냅샷_파일>
+
+# IDAPython 스크립트 생성 (재현 가능한 분석)
+ida-cli -b <hint> export-script --output analysis.py
 ```
 
 ### 7. 바이너리 비교 (패치 디핑)
 ```bash
 # 두 버전의 바이너리 비교
 ida-cli -b <hint> compare old_binary.exe new_binary.exe --out diff.json
+
+# 코드 레벨 비교 (디컴파일된 의사코드)
+ida-cli -b <hint> code-diff <인스턴스_a> <인스턴스_b> [--functions func1 func2]
 ```
 
 ### 8. 종료
