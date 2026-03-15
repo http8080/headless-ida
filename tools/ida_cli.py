@@ -65,6 +65,34 @@ def _opt(args, name, default=None):
     return getattr(args, name, default)
 
 
+def _truncate(s, limit, suffix="..."):
+    """Truncate string to limit, appending suffix if truncated."""
+    return s[:limit - len(suffix)] + suffix if len(s) > limit else s
+
+
+def _md_table_header(*headers):
+    """Return [header_row, separator_row] for a markdown table."""
+    hdr = "| " + " | ".join(headers) + " |"
+    sep = "|" + "|".join("---" for _ in headers) + "|"
+    return [hdr, sep]
+
+
+def _format_arch_info(arch_info):
+    """Format arch_info dict as 'FORMAT ARCH BITSbit' string."""
+    fmt = arch_info.get("file_format", "?")
+    arch = arch_info.get("arch", "?")
+    bits = arch_info.get("bits", "?")
+    return f"{fmt} {arch} {bits}bit"
+
+
+def _print_truncated(items, fmt_fn, max_show=30, indent="    "):
+    """Print items with truncation. fmt_fn(item) -> str."""
+    for item in items[:max_show]:
+        print(f"{indent}{fmt_fn(item)}")
+    if len(items) > max_show:
+        print(f"{indent}... and {len(items) - max_show} more")
+
+
 @contextmanager
 def _registry_locked():
     """Context manager for registry lock acquisition."""
@@ -521,11 +549,8 @@ def cmd_start(args, config, config_path):
     proc = _spawn_server(config, config_path, binary_path, instance_id, idb_path, log_path, fresh)
     state = _wait_for_start(instance_id)
 
-    fmt = arch_info.get("file_format", "?")
-    arch = arch_info.get("arch", "?")
-    bits = arch_info.get("bits", "?")
     _log_ok(f"Instance started: {instance_id}")
-    print(f"    Binary:  {os.path.basename(binary_path)} ({fmt} {arch} {bits}bit)")
+    print(f"    Binary:  {os.path.basename(binary_path)} ({_format_arch_info(arch_info)})")
     print(f"    IDB:     {idb_path}")
     print(f"    Log:     {log_path}")
     print(f"    State:   {state}")
@@ -767,11 +792,11 @@ def _md_decompile(r, with_xrefs=False):
         callers = r.get("callers", [])
         callees = r.get("callees", [])
         if callers:
-            lines += ["", f"## Callers ({len(callers)})", "| Address | Function | Type |", "|---------|----------|------|"]
+            lines += ["", f"## Callers ({len(callers)})"] + _md_table_header("Address", "Function", "Type")
             for c in callers:
                 lines.append(f"| `{c['from_addr']}` | {c['from_name']} | {c['type']} |")
         if callees:
-            lines += ["", f"## Callees ({len(callees)})", "| Address | Function | Type |", "|---------|----------|------|"]
+            lines += ["", f"## Callees ({len(callees)})"] + _md_table_header("Address", "Function", "Type")
             for c in callees:
                 lines.append(f"| `{c['to_addr']}` | {c['to_name']} | {c['type']} |")
     return "\n".join(lines) + "\n"
@@ -791,12 +816,12 @@ def _md_decompile_batch(r):
 def _md_summary(r):
     """Format summary result as markdown."""
     lines = [f"# Binary Summary: {r.get('binary', 'unknown')}", ""]
-    lines += ["## Overview", "| Property | Value |", "|----------|-------|"]
+    lines += ["## Overview"] + _md_table_header("Property", "Value")
     for key in ("ida_version", "decompiler", "func_count", "total_strings", "total_imports", "export_count", "avg_func_size"):
         if key in r:
             lines.append(f"| {key} | {r[key]} |")
     if r.get("segments"):
-        lines += ["", "## Segments", "| Name | Start | End | Size | Perm |", "|------|-------|-----|------|------|"]
+        lines += ["", "## Segments"] + _md_table_header("Name", "Start", "End", "Size", "Perm")
         for s in r["segments"]:
             lines.append(f"| {s.get('name', '')} | `{s.get('start', '')}` | `{s.get('end', '')}` | {s.get('size', '')} | {s.get('perm', '')} |")
     if r.get("top_import_modules"):
@@ -804,7 +829,7 @@ def _md_summary(r):
         for m in r["top_import_modules"]:
             lines.append(f"- **{m['module']}**: {m['count']} imports")
     if r.get("largest_functions"):
-        lines += ["", "## Largest Functions", "| Address | Name | Size |", "|---------|------|------|"]
+        lines += ["", "## Largest Functions"] + _md_table_header("Address", "Name", "Size")
         for f in r["largest_functions"]:
             lines.append(f"| `{f['addr']}` | {f['name']} | {f['size']} |")
     if r.get("strings_sample"):
@@ -847,10 +872,7 @@ def _fmt_func(d):
 
 
 def _fmt_string(d):
-    val = d.get("value", "")
-    if len(val) > STRING_DISPLAY_LIMIT:
-        val = val[:STRING_DISPLAY_LIMIT - 3] + "..."
-    return f"  {d['addr']}  {val}"
+    return f"  {d['addr']}  {_truncate(d.get('value', ''), STRING_DISPLAY_LIMIT)}"
 
 
 def _fmt_import(d):
@@ -1116,10 +1138,7 @@ def cmd_proxy_summary(args, config):
         print()
         print(f"  Strings (first {len(r['strings_sample'])}):")
         for s in r["strings_sample"]:
-            val = s["value"]
-            if len(val) > 60:
-                val = val[:57] + "..."
-            print(f"    {s['addr']}  {val}")
+            print(f"    {s['addr']}  {_truncate(s['value'], 60)}")
 
 
 def _resolve_by_hint(hint, registry):
@@ -1186,27 +1205,21 @@ def cmd_diff(args, config):
 
     if only_a:
         print(f"\n  Only in {bin_a}:")
-        for name in sorted(only_a)[:30]:
-            print(f"    {funcs_a[name]['addr']}  {name}")
-        if len(only_a) > 30:
-            print(f"    ... and {len(only_a) - 30} more")
+        _print_truncated(sorted(only_a), lambda n: f"{funcs_a[n]['addr']}  {n}")
 
     if only_b:
         print(f"\n  Only in {bin_b}:")
-        for name in sorted(only_b)[:30]:
-            print(f"    {funcs_b[name]['addr']}  {name}")
-        if len(only_b) > 30:
-            print(f"    ... and {len(only_b) - 30} more")
+        _print_truncated(sorted(only_b), lambda n: f"{funcs_b[n]['addr']}  {n}")
 
     if size_diff:
-        size_diff.sort(key=lambda x: abs(x[4] - x[2]), reverse=True)  # sort by abs size diff
+        size_diff.sort(key=lambda x: abs(x[4] - x[2]), reverse=True)
         print(f"\n  Size changed ({len(size_diff)}):")
-        for name, addr_a, sa, addr_b, sb in size_diff[:30]:
+        def _fmt_sd(t):
+            name, addr_a, sa, _, sb = t
             delta = sb - sa
             sign = "+" if delta > 0 else ""
-            print(f"    {addr_a}  {name:<40}  {sa} -> {sb} ({sign}{delta})")
-        if len(size_diff) > 30:
-            print(f"    ... and {len(size_diff) - 30} more")
+            return f"{addr_a}  {name:<40}  {sa} -> {sb} ({sign}{delta})"
+        _print_truncated(size_diff, _fmt_sd)
 
 
 def _find_binaries(target_dir):
@@ -1248,10 +1261,7 @@ def _start_batch_instances(batch, config, config_path, idb_dir, fresh):
             continue
         try:
             _spawn_server(config, config_path, norm_path, instance_id, idb_path, log_path, fresh)
-            fmt = arch_info.get("file_format", "?")
-            arch = arch_info.get("arch", "?")
-            bits = arch_info.get("bits", "?")
-            _log_ok(f"{bname} ({fmt} {arch} {bits}bit) -> {instance_id}")
+            _log_ok(f"{bname} ({_format_arch_info(arch_info)}) -> {instance_id}")
             started.append((instance_id, bname))
         except Exception as e:
             _log_err(f"{bname}: {e}")
@@ -1547,7 +1557,7 @@ def _display_profile_result(method, r):
         print(f"    Total: {total}, Showing: {len(data)}")
         for d in data[:10]:
             if "value" in d:
-                print(f"      {d['addr']}  {d['value'][:60]}")
+                print(f"      {d['addr']}  {_truncate(d['value'], 60)}")
             elif "module" in d:
                 print(f"      {d['addr']}  {d.get('module', ''):<20}  {d['name']}")
             elif "name" in d:
@@ -1641,10 +1651,8 @@ def _collect_report_data(config, port, iid, sections):
         total = resp["result"].get("total", 0)
         if not data:
             continue
-        hdr = " | ".join(headers)
-        sep = " | ".join("---" for _ in headers)
-        sections += [f"## {label} ({total} total, showing {len(data)})",
-                     f"| {hdr} |", f"|{sep}|"]
+        sections += [f"## {label} ({total} total, showing {len(data)})"] + \
+                     _md_table_header(*headers)
         for d in data:
             sections.append(fmt_row(d))
         sections.append("")
@@ -1674,7 +1682,7 @@ def _collect_report_bookmarks(binary_name, sections):
     bm_for_binary = {bn: bms for bn, bms in bookmarks.items()
                      if os.path.basename(binary_name).lower() in bn.lower()}
     if bm_for_binary:
-        sections += ["## Bookmarks", "| Address | Tag | Note |", "|---------|-----|------|"]
+        sections += ["## Bookmarks"] + _md_table_header("Address", "Tag", "Note")
         for bms in bm_for_binary.values():
             for bm in bms:
                 note = bm.get("note", "").replace("|", "\\|")
@@ -2032,10 +2040,7 @@ def _display_diff_results(name_a, name_b, funcs_a, funcs_b,
     for label, names, funcs in [("Added", added, funcs_b), ("Removed", removed, funcs_a)]:
         if names:
             print(f"\n  {label} functions ({len(names)}):")
-            for name in sorted(names)[:30]:
-                print(f"    {funcs[name]['addr']}  {name}")
-            if len(names) > 30:
-                print(f"    ... and {len(names) - 30} more")
+            _print_truncated(sorted(names), lambda n: f"{funcs[n]['addr']}  {n}")
 
 
 def cmd_compare(args, config, config_path):

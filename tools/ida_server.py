@@ -64,17 +64,27 @@ AUTO_GENERATED_PREFIXES = (
 # Registry helpers (server-specific)
 # ─────────────────────────────────────────────
 
-def _update_registry(instance_id, updates):
+@contextlib.contextmanager
+def _registry_lock():
+    """Context manager for registry lock acquisition."""
     if not acquire_lock():
-        log.warning("Could not acquire registry lock for update")
+        log.warning("Could not acquire registry lock")
+        yield False
         return
     try:
+        yield True
+    finally:
+        release_lock()
+
+
+def _update_registry(instance_id, updates):
+    with _registry_lock() as ok:
+        if not ok:
+            return
         r = load_registry()
         if instance_id in r:
             r[instance_id].update(updates)
             save_registry(r)
-    finally:
-        release_lock()
 
 
 def _update_state(instance_id, state):
@@ -82,14 +92,12 @@ def _update_state(instance_id, state):
 
 
 def _remove_from_registry(instance_id):
-    if not acquire_lock():
-        return
-    try:
+    with _registry_lock() as ok:
+        if not ok:
+            return
         r = load_registry()
         r.pop(instance_id, None)
         save_registry(r)
-    finally:
-        release_lock()
 
 
 # ─────────────────────────────────────────────
@@ -97,15 +105,13 @@ def _remove_from_registry(instance_id):
 # ─────────────────────────────────────────────
 
 def _save_auth_token(token_path, instance_id, port, token):
-    if not acquire_lock():
-        log.error("Could not acquire lock for auth_token write")
-        return
-    try:
+    with _registry_lock() as ok:
+        if not ok:
+            log.error("Could not acquire lock for auth_token write")
+            return
         os.makedirs(os.path.dirname(token_path), exist_ok=True)
         with open(token_path, "a", encoding="utf-8") as f:
             f.write(f"{instance_id}:{port}:{token}\n")
-    finally:
-        release_lock()
 
 
 # ─────────────────────────────────────────────
@@ -172,19 +178,34 @@ def _bytes_to_hex(raw):
     return " ".join(f"{b:02X}" for b in raw) if raw else ""
 
 
-def _parse_and_apply_type(ea, type_str):
-    """Parse a C type declaration and apply it to an address. Returns tinfo_t."""
+def _require_function(ea):
+    """Get ida_funcs.get_func(ea) or raise NOT_A_FUNCTION."""
+    import ida_funcs
+    func = ida_funcs.get_func(ea)
+    if not func:
+        raise RpcError("NOT_A_FUNCTION", f"No function at {_fmt_addr(ea)}")
+    return func
+
+
+def _parse_type_str(type_str):
+    """Parse a C type declaration string. Returns (tinfo_t, success_bool)."""
     import ida_typeinf
     decl = type_str.rstrip(";") + ";"
     tif = ida_typeinf.tinfo_t()
     til = ida_typeinf.get_idati()
     result = ida_typeinf.parse_decl(tif, til, decl, ida_typeinf.PT_SIL)
-    if result is None:
+    return tif, result is not None
+
+
+def _parse_and_apply_type(ea, type_str):
+    """Parse a C type declaration and apply it to an address. Returns tinfo_t."""
+    import ida_typeinf
+    tif, ok = _parse_type_str(type_str)
+    if not ok:
         raise RpcError("PARSE_TYPE_FAILED",
                         f"Cannot parse type declaration: {type_str}",
                         suggestion="Use C syntax, e.g. 'int __fastcall foo(int a, char *b);'")
-    ok = ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE)
-    if not ok:
+    if not ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE):
         raise RpcError("SET_TYPE_FAILED", f"Cannot apply type at {_fmt_addr(ea)}")
     return tif
 
@@ -410,11 +431,9 @@ def _handle_get_segments(params):
 
 def _handle_decompile(params):
     _require_decompiler()
-    import ida_hexrays, idc, ida_funcs
+    import ida_hexrays, idc
     ea = _resolve_addr(params.get("addr"))
-    func = ida_funcs.get_func(ea)
-    if not func:
-        raise RpcError("NOT_A_FUNCTION", f"No function at {_fmt_addr(ea)}")
+    func = _require_function(ea)
     try:
         cfunc = ida_hexrays.decompile(func.start_ea)
         if not cfunc:
@@ -431,11 +450,9 @@ def _handle_decompile(params):
 def _handle_decompile_with_xrefs(params):
     """Decompile + xrefs_to in a single call."""
     _require_decompiler()
-    import ida_hexrays, idc, ida_funcs, idautils
+    import ida_hexrays, idc, idautils
     ea = _resolve_addr(params.get("addr"))
-    func = ida_funcs.get_func(ea)
-    if not func:
-        raise RpcError("NOT_A_FUNCTION", f"No function at {_fmt_addr(ea)}")
+    func = _require_function(ea)
     try:
         cfunc = ida_hexrays.decompile(func.start_ea)
         if not cfunc:
@@ -785,16 +802,21 @@ def _handle_get_bytes(params):
     }
 
 
+def _resolve_start_addr(params, key="start"):
+    """Resolve optional start address from params, defaulting to first segment."""
+    import idautils
+    start_str = params.get(key)
+    if start_str:
+        return _resolve_addr(start_str)
+    segs = list(idautils.Segments())
+    return segs[0] if segs else 0
+
+
 def _handle_find_bytes(params):
-    import ida_bytes, idautils, idaapi
+    import ida_bytes, idaapi
     pattern = _require_param(params, "pattern")
     max_results = _clamp_int(params, "max_results", DEFAULT_FIND_MAX, MAX_FIND_RESULTS)
-    start_str = params.get("start")
-    if start_str:
-        ea = _resolve_addr(start_str)
-    else:
-        segs = list(idautils.Segments())
-        ea = segs[0] if segs else 0
+    ea = _resolve_start_addr(params)
     matches = []
     for _ in range(max_results):
         ea = ida_bytes.find_bytes(pattern, ea)
@@ -951,10 +973,8 @@ def _import_types(data, stats):
     for entry in data.get("types", []):
         try:
             ea = _resolve_addr(entry["addr"])
-            decl = entry["type"].rstrip(";") + ";"
-            tif = ida_typeinf.tinfo_t()
-            til = ida_typeinf.get_idati()
-            if ida_typeinf.parse_decl(tif, til, decl, ida_typeinf.PT_SIL):
+            tif, ok = _parse_type_str(entry["type"])
+            if ok:
                 ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE)
             stats["types"] += 1
         except Exception:
@@ -1001,9 +1021,46 @@ def _generate_mermaid_graph(nodes, edges):
     return "\n".join(lines)
 
 
+def _collect_call_graph(start_ea, depth, direction, nodes, edges):
+    """Recursively collect call graph nodes and edges.
+
+    direction: "callees" or "callers" (single direction per call).
+    """
+    import idc, ida_funcs, idautils
+
+    def _walk(ea, cur_depth):
+        if cur_depth > depth:
+            return
+        addr_str = _fmt_addr(ea)
+        if addr_str in nodes:
+            return
+        nodes[addr_str] = idc.get_func_name(ea) or addr_str
+        if direction == "callees":
+            func = ida_funcs.get_func(ea)
+            if not func:
+                return
+            seen = set()
+            for item_ea in idautils.FuncItems(func.start_ea):
+                for xref in idautils.XrefsFrom(item_ea):
+                    target = ida_funcs.get_func(xref.to)
+                    if target and target.start_ea != func.start_ea and target.start_ea not in seen:
+                        seen.add(target.start_ea)
+                        t_addr = _fmt_addr(target.start_ea)
+                        edges.append((addr_str, t_addr))
+                        _walk(target.start_ea, cur_depth + 1)
+        else:  # callers
+            for xref in idautils.XrefsTo(ea):
+                caller_func = ida_funcs.get_func(xref.frm)
+                if caller_func and caller_func.start_ea != ea:
+                    c_addr = _fmt_addr(caller_func.start_ea)
+                    edges.append((c_addr, addr_str))
+                    _walk(caller_func.start_ea, cur_depth + 1)
+
+    _walk(start_ea, 0)
+
+
 def _handle_callgraph(params):
     """Build call graph starting from a function."""
-    import idc, ida_funcs, idautils
     ea = _resolve_addr(params.get("addr"))
     depth = _clamp_int(params, "depth", 3, 10)
     direction = params.get("direction", "callees")  # callees, callers, both
@@ -1011,47 +1068,10 @@ def _handle_callgraph(params):
     nodes = {}  # addr -> name
     edges = []  # (from_addr, to_addr)
 
-    def collect_callees(start_ea, cur_depth):
-        if cur_depth > depth:
-            return
-        addr_str = _fmt_addr(start_ea)
-        if addr_str in nodes:
-            return
-        name = idc.get_func_name(start_ea) or addr_str
-        nodes[addr_str] = name
-        func = ida_funcs.get_func(start_ea)
-        if not func:
-            return
-        seen = set()
-        for item_ea in idautils.FuncItems(func.start_ea):
-            for xref in idautils.XrefsFrom(item_ea):
-                target = ida_funcs.get_func(xref.to)
-                if target and target.start_ea != func.start_ea and target.start_ea not in seen:
-                    seen.add(target.start_ea)
-                    t_addr = _fmt_addr(target.start_ea)
-                    edges.append((addr_str, t_addr))
-                    collect_callees(target.start_ea, cur_depth + 1)
-
-    def collect_callers(start_ea, cur_depth):
-        if cur_depth > depth:
-            return
-        addr_str = _fmt_addr(start_ea)
-        if addr_str in nodes:
-            return
-        name = idc.get_func_name(start_ea) or addr_str
-        nodes[addr_str] = name
-        for xref in idautils.XrefsTo(start_ea):
-            caller_func = ida_funcs.get_func(xref.frm)
-            if caller_func and caller_func.start_ea != start_ea:
-                c_addr = _fmt_addr(caller_func.start_ea)
-                edges.append((c_addr, addr_str))
-                collect_callers(caller_func.start_ea, cur_depth + 1)
-
     if direction in ("callees", "both"):
-        collect_callees(ea, 0)
+        _collect_call_graph(ea, depth, "callees", nodes, edges)
     if direction in ("callers", "both"):
-        # Reset nodes tracking for callers if both
-        collect_callers(ea, 0)
+        _collect_call_graph(ea, depth, "callers", nodes, edges)
 
     root_addr = _fmt_addr(ea)
     dot = _generate_dot_graph(nodes, edges, root_addr)
@@ -1141,29 +1161,41 @@ def _handle_search_const(params):
 # Struct/enum management
 # ─────────────────────────────────────────────
 
-def _handle_list_structs(params):
-    """List all structs/unions in the type library."""
+def _list_type_info(check_fn, filt, extra_fn=None):
+    """List types matching check_fn from the type library, filtered by name substring.
+
+    check_fn(tif) -> bool: type filter (e.g. is_struct, is_enum).
+    extra_fn(tif, ordinal) -> dict: extra fields to include per entry.
+    """
     import ida_typeinf
-    filt = params.get("filter", "")
     til = ida_typeinf.get_idati()
-    structs = []
+    result = []
     qty = ida_typeinf.get_ordinal_count(til)
+    filt_lower = filt.lower() if filt else ""
     for ordinal in range(1, qty):
         tif = ida_typeinf.tinfo_t()
-        if tif.get_numbered_type(til, ordinal):
-            if tif.is_struct() or tif.is_union():
-                name = tif.get_type_name()
-                if not name:
-                    continue
-                if filt and filt.lower() not in name.lower():
-                    continue
-                structs.append({
-                    "ordinal": ordinal,
-                    "name": name,
-                    "size": tif.get_size(),
-                    "is_union": tif.is_union(),
-                    "member_count": tif.get_udt_nmembers(),
-                })
+        if tif.get_numbered_type(til, ordinal) and check_fn(tif):
+            name = tif.get_type_name()
+            if not name:
+                continue
+            if filt_lower and filt_lower not in name.lower():
+                continue
+            entry = {"ordinal": ordinal, "name": name}
+            if extra_fn:
+                entry.update(extra_fn(tif, ordinal))
+            result.append(entry)
+    return result
+
+
+def _handle_list_structs(params):
+    """List all structs/unions in the type library."""
+    filt = params.get("filter", "")
+    structs = _list_type_info(
+        lambda tif: tif.is_struct() or tif.is_union(),
+        filt,
+        lambda tif, _: {"size": tif.get_size(), "is_union": tif.is_union(),
+                         "member_count": tif.get_udt_nmembers()},
+    )
     return {"total": len(structs), "structs": structs}
 
 
@@ -1299,25 +1331,12 @@ def _handle_snapshot_restore(params):
 
 def _handle_list_enums(params):
     """List all enums in the type library."""
-    import ida_typeinf
     filt = params.get("filter", "")
-    til = ida_typeinf.get_idati()
-    enums = []
-    qty = ida_typeinf.get_ordinal_count(til)
-    for ordinal in range(1, qty):
-        tif = ida_typeinf.tinfo_t()
-        if tif.get_numbered_type(til, ordinal):
-            if tif.is_enum():
-                name = tif.get_type_name()
-                if not name:
-                    continue
-                if filt and filt.lower() not in name.lower():
-                    continue
-                enums.append({
-                    "ordinal": ordinal,
-                    "name": name,
-                    "member_count": tif.get_enum_nmembers(),
-                })
+    enums = _list_type_info(
+        lambda tif: tif.is_enum(),
+        filt,
+        lambda tif, _: {"member_count": tif.get_enum_nmembers()},
+    )
     return {"total": len(enums), "enums": enums}
 
 
@@ -1433,11 +1452,9 @@ def _handle_search_code(params):
 def _handle_decompile_diff(params):
     """Decompile a function and return code for diffing."""
     _require_decompiler()
-    import ida_hexrays, idc, ida_funcs
+    import ida_hexrays, idc
     ea = _resolve_addr(params.get("addr"))
-    func = ida_funcs.get_func(ea)
-    if not func:
-        raise RpcError("NOT_A_FUNCTION", f"No function at {_fmt_addr(ea)}")
+    func = _require_function(ea)
     try:
         cfunc = ida_hexrays.decompile(func.start_ea)
         code = str(cfunc) if cfunc else ""
@@ -1536,9 +1553,39 @@ def _handle_auto_rename(params):
 # Generate IDAPython script from modifications
 # ─────────────────────────────────────────────
 
+def _collect_func_metadata():
+    """Single-pass collection of renames, comments, and types from all functions."""
+    import idc, idautils, ida_funcs
+    rename_lines, comment_lines, type_lines = [], [], []
+    for ea in idautils.Functions():
+        addr = _fmt_addr(ea)
+        name = idc.get_func_name(ea)
+        if name and not any(name.startswith(p) for p in AUTO_GENERATED_PREFIXES):
+            rename_lines.append(f'idc.set_name({addr}, "{name}", idc.SN_NOWARN)')
+        cmt = idc.get_cmt(ea, False)
+        if cmt:
+            comment_lines.append(f'idc.set_cmt({addr}, {repr(cmt)}, False)')
+        rcmt = idc.get_cmt(ea, True)
+        if rcmt:
+            comment_lines.append(f'idc.set_cmt({addr}, {repr(rcmt)}, True)')
+        fcmt = idc.get_func_cmt(ea, False)
+        if fcmt:
+            comment_lines.append(f'idc.set_func_cmt({addr}, {repr(fcmt)}, False)')
+        type_str = idc.get_type(ea)
+        if type_str:
+            type_lines.append(f'idc.SetType({addr}, "{type_str}")')
+    # Non-function names
+    for item in idautils.Names():
+        ea, name = item[0], item[1]
+        if not any(name.startswith(p) for p in AUTO_GENERATED_PREFIXES):
+            if not ida_funcs.get_func(ea):
+                rename_lines.append(f'idc.set_name({_fmt_addr(ea)}, "{name}", idc.SN_NOWARN)')
+    return rename_lines, comment_lines, type_lines
+
+
 def _handle_export_script(params):
     """Generate reproducible IDAPython script from analysis."""
-    import idc, idautils, ida_funcs, ida_nalt
+    rename_lines, comment_lines, type_lines = _collect_func_metadata()
     lines = [
         "#!/usr/bin/env python3",
         '"""Auto-generated IDAPython script from ida-cli analysis."""',
@@ -1546,56 +1593,18 @@ def _handle_export_script(params):
         "import ida_typeinf",
         "",
     ]
-    # Renames
-    rename_count = 0
-    for ea in idautils.Functions():
-        name = idc.get_func_name(ea)
-        if name and not any(name.startswith(p) for p in AUTO_GENERATED_PREFIXES):
-            lines.append(f'idc.set_name({_fmt_addr(ea)}, "{name}", idc.SN_NOWARN)')
-            rename_count += 1
-    for item in idautils.Names():
-        ea, name = item[0], item[1]
-        if not any(name.startswith(p) for p in AUTO_GENERATED_PREFIXES):
-            func = ida_funcs.get_func(ea)
-            if not func:
-                lines.append(f'idc.set_name({_fmt_addr(ea)}, "{name}", idc.SN_NOWARN)')
-                rename_count += 1
-    lines.append("")
-
-    # Comments
-    comment_count = 0
-    for ea in idautils.Functions():
-        cmt = idc.get_cmt(ea, False)
-        rcmt = idc.get_cmt(ea, True)
-        fcmt = idc.get_func_cmt(ea, False)
-        if cmt:
-            lines.append(f'idc.set_cmt({_fmt_addr(ea)}, {repr(cmt)}, False)')
-            comment_count += 1
-        if rcmt:
-            lines.append(f'idc.set_cmt({_fmt_addr(ea)}, {repr(rcmt)}, True)')
-            comment_count += 1
-        if fcmt:
-            lines.append(f'idc.set_func_cmt({_fmt_addr(ea)}, {repr(fcmt)}, False)')
-            comment_count += 1
-    lines.append("")
-
-    # Types
-    type_count = 0
-    for ea in idautils.Functions():
-        type_str = idc.get_type(ea)
-        if type_str:
-            lines.append(f'idc.SetType({_fmt_addr(ea)}, "{type_str}")')
-            type_count += 1
-
-    lines.append("")
-    lines.append(f'print(f"Applied {{renames}} renames, {{comments}} comments, {{types}} types")')
-    lines.append(f'renames = {rename_count}')
-    lines.append(f'comments = {comment_count}')
-    lines.append(f'types = {type_count}')
-
+    lines += rename_lines + [""] + comment_lines + [""] + type_lines
+    rc, cc, tc = len(rename_lines), len(comment_lines), len(type_lines)
+    lines += [
+        "",
+        f'renames = {rc}',
+        f'comments = {cc}',
+        f'types = {tc}',
+        f'print(f"Applied {{renames}} renames, {{comments}} comments, {{types}} types")',
+    ]
     script = "\n".join(lines)
     saved_to = _save_output(params.get("output"), script)
-    return {"renames": rename_count, "comments": comment_count, "types": type_count, "saved_to": saved_to}
+    return {"renames": rc, "comments": cc, "types": tc, "saved_to": saved_to}
 
 
 # ─────────────────────────────────────────────
