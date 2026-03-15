@@ -111,7 +111,7 @@ ida-cli -b <hint> callees <addr>                           # Shortcut: xrefs --d
 ida-cli -b <hint> cross-refs <addr|name> --depth 3 --direction to|from|both
   # Options: --format mermaid|dot, --out F
 ```
-> **xrefs vs cross-refs**: `xrefs` = direct (1-level) references. `cross-refs` = recursive chain tracing up to `--depth` levels with mermaid/DOT graph output.
+> **xrefs vs cross-refs**: `xrefs` shows direct (1-level) references. `cross-refs` traces chains recursively up to `--depth` levels and outputs as mermaid/DOT graph. Use `xrefs` for quick lookups, `cross-refs` for understanding call chains.
 
 ### Call Graph & Control Flow
 ```bash
@@ -129,6 +129,8 @@ ida-cli -b <hint> basic-blocks <addr> --graph-only   # Graph output only
 ```bash
 ida-cli -b <hint> search-code "keyword" --max 10      # Search in decompiled pseudocode
   # Options: --max-funcs N (limit functions to scan), --case-sensitive
+  # WARNING: Decompiles every function to search. Slow on large binaries (1000+ funcs).
+  #          Use --max-funcs to limit scope, or prefer strings-xrefs for string searches.
 ida-cli -b <hint> search-const 0x1234 --max 20 [--out F]  # Search constant/immediate values
 ida-cli -b <hint> find_pattern "48 8B ? ? 00" --max 20 [--out F]  # Byte pattern search
 ida-cli -b <hint> strings-xrefs --filter http --max 20  # Strings + referencing functions
@@ -217,9 +219,9 @@ ida-cli -b <hint> report output.md --functions 0x401000 0x402000  # Include deco
 ida-cli batch <directory> --idb-dir . --timeout 300
 
 # Automated analysis profiles
-ida-cli -b <hint> profile run malware
-ida-cli -b <hint> profile run vuln
-ida-cli -b <hint> profile run firmware
+ida-cli -b <hint> profile run malware    # C2, crypto, anti-analysis, network APIs
+ida-cli -b <hint> profile run vuln       # Dangerous functions (memcpy, strcpy, sprintf, system)
+ida-cli -b <hint> profile run firmware   # Peripherals (UART/SPI/GPIO), protocols, boot
 ```
 
 ### Binary Comparison (Patch Diffing)
@@ -249,8 +251,8 @@ ida-cli completions --shell bash|zsh|powershell   # Generate shell completions
 - `-b <hint>` -- Select instance by binary name substring (e.g., `-b note` for notepad.exe)
 - `-i <id>` -- Select instance by ID
 - `--out <path>` -- Save output to file (decompile/decompile_batch suppress inline output)
-- `--count N` / `--offset N` -- Pagination for list commands (functions, strings, imports, exports)
-- `--max N` -- Limit results for search commands (find_func, find_pattern, search-const, search-code, vtables)
+- `--count N` / `--offset N` -- Pagination for list commands (functions, strings, imports, exports, structs, enums)
+- `--max N` -- Limit results for search commands (find_func, find_pattern, search-const, search-code, vtables, strings-xrefs, data-refs)
 - `--filter <keyword>` -- Filter results by name substring
 - `--format mermaid|dot` -- Graph output format (callgraph, cross-refs, basic-blocks)
 - `--json` -- JSON output mode
@@ -359,6 +361,9 @@ ida-cli -b <hint> strings-xrefs --filter login --max 20
 # BAD: fetches all 2000 functions
 ida-cli -b <hint> functions
 
+# GOOD: just get the count first
+ida-cli -b <hint> functions --count-only
+
 # GOOD: paginate with --count and --offset
 ida-cli -b <hint> functions --count 30
 ida-cli -b <hint> functions --count 30 --offset 30  # next page
@@ -378,20 +383,211 @@ Each subagent returns only a summary, keeping main context clean.
 - Use `profile run <type>` for automated reconnaissance
 - Use `--json` for machine-readable output when post-processing
 
-## Error Handling
+## Output Format Examples
 
-- Analysis failure: `logs <id> --tail 20`
-- Locked/corrupted .i64 (`open_database returned 2`): delete .i64, restart with `--fresh`
-- Rebuild .i64: `start <binary> --fresh`
-- Instance issues: `list` then `cleanup`
+### summary
+```
+Binary:      example.exe
+Decompiler:  True
+IDA:         9.3
+Functions:   521  (avg size: 293 bytes)
+Strings:     584
+Imports:     340
+Exports:     1
+```
+
+### decompile
+```
+// wWinMain @ 0x140010100
+int __stdcall wWinMain(HINSTANCE hInstance, ...) {
+  /* 0x140010119 */ sub_rsp(0x90);
+  ...
+}
+```
+
+### decompile --raw
+```
+int __stdcall wWinMain(HINSTANCE hInstance, ...) {
+  sub_rsp(0x90);
+  ...
+}
+```
+(No header line, no address comments — minimal tokens for LLM analysis)
+
+### functions
+```
+0x140001000  sub_140001000                                     size=42
+0x14000102A  wWinMain                                          size=1200
+```
+
+### xrefs / callers / callees
+```
+Xrefs TO 0x140010100 (3)
+  0x14001A000  sub_14001A000                     Code_Near
+  0x14001B200  __mainCRTStartup                  Code_Near
+```
+
+### func-similarity
+```
+  Function A: sub_140001000 (0x140001000)  size=256  blocks=12  callees=5
+  Function B: sub_140002000 (0x140002000)  size=280  blocks=14  callees=6
+
+  Similarity:
+    Size ratio:      0.9143
+    Block ratio:     0.8571
+    Callee Jaccard:  0.6000
+    Overall:         0.7905
+```
+(Overall 1.0 = identical, 0.0 = completely different)
+
+### stack-frame
+```
+  Function: process_data (0x140001000)
+  Frame size: 120  (locals=96, args=16, retaddr=8)
+  Members: 5
+
+  | Offset |   Size | Name                           | Type                 | Kind |
+  |     0  |     64 | buf                            | char[64]             | local|
+  |    64  |      8 | result                         | __int64              | local|
+  |    96  |      8 | return_addr                    |                      | retaddr|
+  |   104  |      8 | arg_0                          | void *               | arg  |
+```
+
+### find_func
+```
+Query: 'main' (3 matches)
+  0x140010100  wWinMain
+  0x14001A000  __mainCRTStartup
+  0x14001B200  mainCRTStartup
+```
+
+### search-const
+```
+  Value: 0x1234  Found: 2
+    0x140001050  cmp     eax, 1234h  [sub_140001000]
+    0x140002100  mov     ecx, 1234h  [process_data]
+```
+
+### find_pattern
+```
+Pattern: '48 8B ? ? 00' (5 matches)
+  0x140001000
+  0x140001200
+  0x140002500
+```
+
+### vtables
+```
+VTables found: 2
+  0x140050000  4 entries  [near CMyClass::vftable]
+    [0] 0x140001000  sub_140001000
+    [1] 0x140001200  sub_140001200
+    [2] 0x140001400  sub_140001400
+    [3] 0x140001600  sub_140001600
+  0x140050040  3 entries
+    [0] 0x140002000  sub_140002000
+    [1] 0x140002200  sub_140002200
+    [2] 0x140002400  sub_140002400
+```
+
+### decompile-all --split
+When `--split` is used, `--out` is treated as a directory path. Each function is saved to a separate `.c` file named after the function:
+```
+output_dir/
+  wWinMain.c
+  sub_140001000.c
+  process_data.c
+  ...
+```
+Without `--split`, all functions are written to a single file separated by `// ── funcname` headers.
+
+### callgraph (mermaid)
+```mermaid
+graph TD
+  main --> init_config
+  main --> process_data
+  process_data --> validate_input
+```
+
+## Analysis Decision Flowchart
+
+```
+What are you analyzing?
+│
+├─ Unknown binary (first look)
+│  → summary → strings --filter <keyword> → xrefs → decompile
+│
+├─ Looking for specific function
+│  → find_func <name> [--regex] → decompile → callers / callees
+│
+├─ Vulnerability hunting
+│  → imports (memcpy, strcpy, sprintf, system, exec)
+│  → xrefs on dangerous funcs → decompile call sites
+│  → bytes to verify buffer sizes
+│
+├─ Malware analysis
+│  → profile run malware (automated recon)
+│  → strings (C2, URLs, registry) → imports (network, process APIs)
+│  → find_func --regex "crypt|encode|xor" → decompile_batch
+│
+├─ Comparing two versions (patch diff)
+│  → start both binaries → code-diff or compare
+│
+├─ Understanding call flow
+│  → callgraph <addr> --direction callees --depth 3
+│  → basic-blocks <addr> for CFG
+│
+├─ Bulk analysis / full dump
+│  → decompile-all --out /tmp/all.c [--filter X]
+│  → decompile_batch <addr1> <addr2> ... --out /tmp/batch.c
+│
+└─ Firmware/IoT
+   → segments (memory layout) → strings (device IDs, protocols)
+   → find_func --regex "uart|spi|i2c|gpio" → exports
+```
+
+## Common Pitfalls
+
+1. **Not waiting after start** — `start` returns immediately while IDA analyzes. Always `wait <id> --timeout 300` before any analysis command.
+
+2. **Forgetting `--out` for decompile** — Decompile output floods context window. Always use `--out /tmp/file` then `Read` the file.
+
+3. **Address format** — IDA expects hex with `0x` prefix (e.g., `0x140001000`). Function names also work (e.g., `main`, `sub_140001000`).
+
+4. **xrefs direction confusion** — `--direction to` = "who calls this" (callers), `--direction from` = "what this calls" (callees). Use `callers`/`callees` shortcuts to avoid confusion.
+
+5. **Locked .i64** — Error `open_database returned 2` means IDB is locked/corrupted. Delete the `.i64` file and restart with `--fresh`.
+
+6. **No decompiler** — Not all IDA installs have Hex-Rays. Check `summary` for `decompiler: true/false`. Without it, use `disasm` instead.
+
+7. **Forgetting to save** — After `rename`/`set_type`/`comment`, run `save` to persist changes to the .i64 database.
+
+8. **Context flooding from large lists** — Never fetch all functions/strings at once. Use `--count 30` and `--offset` for pagination.
+
+## Error Handling & Troubleshooting
+
+| Error | Cause | Solution |
+|-------|-------|----------|
+| `open_database returned 2` | .i64 locked or corrupted | Delete .i64, restart with `--fresh` |
+| `CONNECTION_FAILED` | Server process crashed | Run `cleanup`, then `start` again |
+| `NOT_A_FUNCTION` | Address is not inside a function | Check the hint in error message for nearest functions |
+| `INVALID_ADDRESS` | Symbol name not found | Use `find_func --regex <name>` or `functions --filter <name>` |
+| `DECOMPILER_NOT_LOADED` | No Hex-Rays license | Use `disasm` instead of `decompile` |
+| `EXEC_DISABLED` | exec not enabled | Set `security.exec_enabled=true` in config.json |
+| `TIMEOUT` | Analysis taking too long | Increase `--timeout`, or check `logs <id>` for issues |
+| Instance shows "analyzing" | Initial auto-analysis running | Wait: `wait <id> --timeout 300` |
+
+### Quick Fixes
+- **Analysis failure**: `logs <id> --tail 20` to check what went wrong
+- **Stale instances**: `list` then `cleanup` to remove dead entries
+- **Rebuild .i64**: `start <binary> --fresh` (ignores existing database)
 
 ## Tool Selection
 
 | Binary Type | Tool |
 |-------------|------|
 | Java/Kotlin (APK) | JADX |
-| Native binaries (.so, .dll, .exe, .dylib) | **IDA CLI** |
-| Security solutions, multi-arch | **IDA CLI** |
+| Native code (.so, .dll, .exe, .dylib), security solutions, multi-arch | **IDA CLI** |
 | Firmware/IoT | **IDA CLI** |
 
 ## User Argument: $ARGUMENTS
