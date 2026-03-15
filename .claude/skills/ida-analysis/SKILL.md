@@ -93,7 +93,7 @@ ida-cli -b <hint> disasm <addr|name> --count 50
 
 ### Function Analysis
 ```bash
-ida-cli -b <hint> find_func <name> [--regex]       # Find function by name/regex
+ida-cli -b <hint> find_func <name> [--regex] [--out F]  # Find function by name/regex
 ida-cli -b <hint> func_info <addr|name>             # Function details (size, args, type)
 ida-cli -b <hint> stack-frame <addr|name>            # Stack frame layout (locals, args, offsets)
 ida-cli -b <hint> switch-table <addr|name>           # Analyze switch/jump tables
@@ -103,12 +103,16 @@ ida-cli -b <hint> auto-rename [--apply] [--max-funcs 200]  # Heuristic rename su
 
 ### Cross-References
 ```bash
+# xrefs: single-level cross-references (direct callers/callees only)
 ida-cli -b <hint> xrefs <addr> --direction to|from|both
 ida-cli -b <hint> callers <addr>                           # Shortcut: xrefs --direction to
 ida-cli -b <hint> callees <addr>                           # Shortcut: xrefs --direction from
+
+# cross-refs: multi-level chain tracing (follows caller chains up to --depth levels)
 ida-cli -b <hint> cross-refs <addr|name> --depth 3 --direction to|from|both
   # Options: --format mermaid|dot, --out F
 ```
+> **xrefs vs cross-refs**: `xrefs` shows direct (1-level) references. `cross-refs` traces chains recursively up to `--depth` levels and outputs as mermaid/DOT graph. Use `xrefs` for quick lookups, `cross-refs` for understanding call chains.
 
 ### Call Graph & Control Flow
 ```bash
@@ -128,8 +132,8 @@ ida-cli -b <hint> search-code "keyword" --max 10      # Search in decompiled pse
   # Options: --max-funcs N (limit functions to scan)
   # WARNING: Decompiles every function to search. Slow on large binaries (1000+ funcs).
   #          Use --max-funcs to limit scope, or prefer strings-xrefs for string searches.
-ida-cli -b <hint> search-const 0x1234 --max 20         # Search constant/immediate values
-ida-cli -b <hint> find_pattern "48 8B ? ? 00" --max 20 # Byte pattern search
+ida-cli -b <hint> search-const 0x1234 --max 20 [--out F]  # Search constant/immediate values
+ida-cli -b <hint> find_pattern "48 8B ? ? 00" --max 20 [--out F]  # Byte pattern search
 ida-cli -b <hint> strings-xrefs --filter http --max 20  # Strings + referencing functions
   # Options: --min-refs N, --out F
 ida-cli -b <hint> data-refs --max 50                    # Data segment reference analysis
@@ -181,7 +185,7 @@ ida-cli -b <hint> save                                 # Save IDB
 ### Annotations & Snapshots
 ```bash
 # Export/import all names/comments/types as JSON
-ida-cli -b <hint> annotations export --output analysis.json
+ida-cli -b <hint> annotations export --out analysis.json
 ida-cli -b <hint> annotations import analysis.json
 
 # IDB snapshots (backup before experimental changes)
@@ -190,7 +194,7 @@ ida-cli -b <hint> snapshot list                        # Shows description from 
 ida-cli -b <hint> snapshot restore <snapshot_file>     # Auto-resolves from IDB dir
 
 # Generate IDAPython script (reproducible analysis)
-ida-cli -b <hint> export-script --output analysis.py
+ida-cli -b <hint> export-script --out analysis.py
 ```
 
 ### Bookmarks (address tagging across sessions)
@@ -248,7 +252,8 @@ ida-cli completions --shell bash|zsh|fish|powershell   # Generate shell completi
 - `-b <hint>` -- Select instance by binary name substring (e.g., `-b note` for notepad.exe)
 - `-i <id>` -- Select instance by ID
 - `--out <path>` -- Save output to file (decompile/decompile_batch suppress inline output)
-- `--count N` / `--offset N` -- Pagination for large result sets
+- `--count N` / `--offset N` -- Pagination for list commands (functions, strings, imports, exports, structs, enums)
+- `--max N` -- Limit results for search commands (find_func, find_pattern, search-const, search-code, vtables, strings-xrefs, data-refs)
 - `--filter <keyword>` -- Filter results by name substring
 - `--format mermaid|dot` -- Graph output format (callgraph, cross-refs, basic-blocks)
 - `--json` -- JSON output mode
@@ -448,6 +453,54 @@ Xrefs TO 0x140010100 (3)
   |    96  |      8 | return_addr                    |                      | retaddr|
   |   104  |      8 | arg_0                          | void *               | arg  |
 ```
+
+### find_func
+```
+Query: 'main' (3 matches)
+  0x140010100  wWinMain
+  0x14001A000  __mainCRTStartup
+  0x14001B200  mainCRTStartup
+```
+
+### search-const
+```
+  Value: 0x1234  Found: 2
+    0x140001050  cmp     eax, 1234h  [sub_140001000]
+    0x140002100  mov     ecx, 1234h  [process_data]
+```
+
+### find_pattern
+```
+Pattern: '48 8B ? ? 00' (5 matches)
+  0x140001000
+  0x140001200
+  0x140002500
+```
+
+### vtables
+```
+VTables found: 2
+  0x140050000  4 entries  [near CMyClass::vftable]
+    [0] 0x140001000  sub_140001000
+    [1] 0x140001200  sub_140001200
+    [2] 0x140001400  sub_140001400
+    [3] 0x140001600  sub_140001600
+  0x140050040  3 entries
+    [0] 0x140002000  sub_140002000
+    [1] 0x140002200  sub_140002200
+    [2] 0x140002400  sub_140002400
+```
+
+### decompile-all --split
+When `--split` is used, `--out` is treated as a directory path. Each function is saved to a separate `.c` file named after the function:
+```
+output_dir/
+  wWinMain.c
+  sub_140001000.c
+  process_data.c
+  ...
+```
+Without `--split`, all functions are written to a single file separated by `// ── funcname` headers.
 
 ### callgraph (mermaid)
 ```mermaid

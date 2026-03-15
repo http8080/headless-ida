@@ -177,7 +177,7 @@ ida-cli -b <hint> save                                  # IDB 저장
 ### 분석 결과 관리 & 스냅샷
 ```bash
 # 이름/주석/타입 JSON 내보내기/가져오기
-ida-cli -b <hint> annotations export --output analysis.json
+ida-cli -b <hint> annotations export --out analysis.json
 ida-cli -b <hint> annotations import analysis.json
 
 # IDB 스냅샷 (실험적 변경 전 백업)
@@ -186,7 +186,7 @@ ida-cli -b <hint> snapshot list                        # .meta.json에서 설명
 ida-cli -b <hint> snapshot restore <스냅샷_파일>       # IDB 디렉토리에서 자동 resolve
 
 # IDAPython 스크립트 생성 (재현 가능한 분석)
-ida-cli -b <hint> export-script --output analysis.py
+ida-cli -b <hint> export-script --out analysis.py
 ```
 
 ### 북마크 (분석 세션 간 주소 태깅)

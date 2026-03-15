@@ -2,7 +2,7 @@
 
 import argparse
 
-_CLI_VERSION = "2.1.0"
+_CLI_VERSION = "2.2.0"
 
 from shared import init_registry_paths
 
@@ -203,6 +203,7 @@ def _build_parser():
     p.add_argument("name")
     p.add_argument("--regex", action="store_true")
     p.add_argument("--max", type=int, default=None)
+    p.add_argument("--out", default=None)
 
     p = sub.add_parser("func_info", parents=[common])
     p.add_argument("addr")
@@ -216,6 +217,7 @@ def _build_parser():
     p = sub.add_parser("find_pattern", parents=[common])
     p.add_argument("pattern")
     p.add_argument("--max", type=int, default=None)
+    p.add_argument("--out", default=None)
 
     p = sub.add_parser("comments", parents=[common])
     p.add_argument("addr")
@@ -283,7 +285,7 @@ def _build_parser():
     ann = sub.add_parser("annotations", help="Export/import annotations", parents=[common])
     ann_sub = ann.add_subparsers(dest="action")
     ann_exp = ann_sub.add_parser("export", help="Export annotations")
-    ann_exp.add_argument("--output", default="annotations.json", help="Output JSON file")
+    ann_exp.add_argument("--out", default="annotations.json", help="Output JSON file")
     ann_imp = ann_sub.add_parser("import", help="Import annotations")
     ann_imp.add_argument("input_file", help="JSON annotations file")
 
@@ -301,6 +303,7 @@ def _build_parser():
     p = sub.add_parser("search-const", help="Search constant/immediate values", parents=[common])
     p.add_argument("value", help="Value to search (hex or decimal)")
     p.add_argument("--max", type=int, default=None, help="Max results")
+    p.add_argument("--out", default=None)
 
     stru = sub.add_parser("structs", help="Manage structs", parents=[common])
     stru_sub = stru.add_subparsers(dest="action")
@@ -358,7 +361,7 @@ def _build_parser():
     p.add_argument("--max-funcs", type=int, default=200)
 
     p = sub.add_parser("export-script", help="Generate IDAPython script", parents=[common])
-    p.add_argument("--output", default="analysis.py", help="Output .py file")
+    p.add_argument("--out", default="analysis.py", help="Output .py file")
 
     p = sub.add_parser("vtables", help="Detect virtual function tables", parents=[common])
     p.add_argument("--max", type=int, default=None)

@@ -177,7 +177,7 @@ ida-cli -b <hint> save                                 # Save IDB
 ### Annotations & Snapshots
 ```bash
 # Export/import all names/comments/types as JSON
-ida-cli -b <hint> annotations export --output analysis.json
+ida-cli -b <hint> annotations export --out analysis.json
 ida-cli -b <hint> annotations import analysis.json
 
 # IDB snapshots (backup before experimental changes)
@@ -186,7 +186,7 @@ ida-cli -b <hint> snapshot list                        # Shows description from 
 ida-cli -b <hint> snapshot restore <snapshot_file>     # Auto-resolves from IDB dir
 
 # Generate IDAPython script (reproducible analysis)
-ida-cli -b <hint> export-script --output analysis.py
+ida-cli -b <hint> export-script --out analysis.py
 ```
 
 ### Bookmarks (address tagging across sessions)

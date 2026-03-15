@@ -477,9 +477,15 @@ def cmd_proxy_find_func(args, config):
     if _opt(args, 'max'): p["max_results"] = args.max
     r = _rpc_call(args, config, "find_func", p)
     if not r: return
-    print(f"Query: '{r['query']}' ({r['total']} matches)")
+    lines = [f"Query: '{r['query']}' ({r['total']} matches)"]
     for m in r.get("matches", []):
-        print(f"  {m['addr']}  {m['name']}")
+        lines.append(f"  {m['addr']}  {m['name']}")
+    text = "\n".join(lines)
+    out = _opt(args, 'out')
+    if out:
+        _save_local(out, text)
+    else:
+        print(text)
 
 
 def cmd_proxy_func_info(args, config):
@@ -517,9 +523,15 @@ def cmd_proxy_find_pattern(args, config):
     if _opt(args, 'max'): p["max_results"] = args.max
     r = _rpc_call(args, config, "find_bytes", p)
     if not r: return
-    print(f"Pattern: '{r['pattern']}' ({r['total']} matches)")
+    lines = [f"Pattern: '{r['pattern']}' ({r['total']} matches)"]
     for addr in r.get("matches", []):
-        print(f"  {addr}")
+        lines.append(f"  {addr}")
+    text = "\n".join(lines)
+    out = _opt(args, 'out')
+    if out:
+        _save_local(out, text)
+    else:
+        print(text)
 
 
 def cmd_proxy_comments(args, config):
@@ -1287,7 +1299,7 @@ def cmd_annotations(args, config):
     action = _opt(args, 'action', 'export')
 
     if action == "export":
-        out_path = _opt(args, 'output') or "annotations.json"
+        out_path = _opt(args, 'out') or "annotations.json"
         p = {}
         r = _rpc_call(args, config, "export_annotations", p)
         if not r:
@@ -1370,11 +1382,17 @@ def cmd_search_const(args, config):
     r = _rpc_call(args, config, "search_const", p)
     if not r:
         return
-    print(f"  Value: {r.get('value', '')}  Found: {r.get('total', 0)}")
+    lines = [f"  Value: {r.get('value', '')}  Found: {r.get('total', 0)}"]
     for entry in r.get("results", []):
         func = entry.get("func", "")
         func_str = f"  [{func}]" if func else ""
-        print(f"    {entry['addr']}  {entry.get('disasm', '')}{func_str}")
+        lines.append(f"    {entry['addr']}  {entry.get('disasm', '')}{func_str}")
+    text = "\n".join(lines)
+    out = _opt(args, 'out')
+    if out:
+        _save_local(out, text)
+    else:
+        print(text)
 
 
 # ─────────────────────────────────────────────
@@ -1760,7 +1778,7 @@ def cmd_auto_rename(args, config):
 
 def cmd_export_script(args, config):
     """Generate IDAPython script from analysis modifications."""
-    out_path = _opt(args, 'output', 'analysis.py') or 'analysis.py'
+    out_path = _opt(args, 'out', 'analysis.py') or 'analysis.py'
     p = {"output": out_path}
     r = _rpc_call(args, config, "export_script", p)
     if not r:
