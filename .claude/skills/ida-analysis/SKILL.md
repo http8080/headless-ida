@@ -14,121 +14,251 @@ Do NOT use MCP or other tools for IDA operations.
 ## Quick Start
 
 ```bash
-# 1. Start instance (save IDB in project dir)
+# 1. Environment check (first time only)
+ida-cli --check
+ida-cli --init
+
+# 2. Start instance (save IDB in project dir)
 ida-cli start <binary_path> --idb-dir .
 ida-cli wait <id> --timeout 300
 
-# 2. Overview
+# 3. Overview
 ida-cli -b <hint> summary
 
-# 3. Analyze
+# 4. Analyze
 ida-cli -b <hint> decompile <addr|name>
 ida-cli -b <hint> xrefs <addr> --direction both
 
-# 4. Stop
+# 5. Stop
 ida-cli stop <id>
 ```
 
-## Command Reference
+## Complete Command Reference
+
+### Environment & Setup
+```bash
+ida-cli --check                           # Check IDA/Python environment
+ida-cli --init                            # Initialize directories
+```
 
 ### Instance Management
-| Command | Description |
-|---------|-------------|
-| `start <binary> --idb-dir .` | Start analysis (always use `--idb-dir .`) |
-| `stop <id>` | Stop instance |
-| `status` / `-b <hint> status` | Instance status |
-| `wait <id> --timeout N` | Wait for analysis completion |
-| `list` / `list --json` | List all instances |
-| `logs <id> --tail N` | View instance logs |
-| `cleanup` | Remove stale instances |
+```bash
+ida-cli start <binary> --idb-dir .        # Start analysis (always use --idb-dir .)
+  # Options: --fresh (ignore existing .i64), --force (allow duplicate instances)
+ida-cli stop <id>                         # Stop instance
+ida-cli status                            # Status (auto-resolves -b hint)
+ida-cli wait <id> --timeout 300           # Wait for analysis completion
+ida-cli list                              # List all instances
+ida-cli list --json                       # List instances as JSON (includes idb_path)
+ida-cli logs <id> --tail 20               # View instance logs
+ida-cli cleanup                           # Remove stale instances
+ida-cli save                              # Save IDB database
+```
 
 ### Reconnaissance
-| Command | Description |
-|---------|-------------|
-| `summary` | Full overview (segments, imports, functions, strings) |
-| `segments` | Memory layout |
-| `imagebase` | Binary base address |
-| `functions [--filter X] [--count N] [--offset N]` | List functions |
-| `strings [--filter X] [--count N]` | List strings |
-| `imports [--filter X] [--count N]` | List imports |
-| `exports` | List exports |
+```bash
+ida-cli -b <hint> summary                 # Full overview (segments, imports, functions, strings)
+ida-cli -b <hint> segments                # Memory layout (addr, name, class, size, perms)
+ida-cli -b <hint> imagebase               # Binary base address
 
-### Deep Analysis
-| Command | Description |
-|---------|-------------|
-| `decompile <addr\|name> [--out F] [--with-xrefs]` | Decompile (--out suppresses inline, saves only) |
-| `decompile_batch <a1> <a2> ... [--out F]` | Batch decompile (--out suppresses inline) |
-| `decompile-all --out F [--filter X]` | Decompile all functions |
-| `disasm <addr\|name> --count N` | Disassemble |
-| `find_func <name> [--regex]` | Find function by name |
-| `func_info <addr\|name>` | Function details (size, args, type) |
-| `xrefs <addr> --direction to\|from\|both` | Cross-references |
-| `cross-refs <addr> --depth N --direction to\|from\|both` | Multi-level xref chain |
-| `callgraph <addr> --depth N --direction callers\|callees` | Call graph (mermaid/dot) |
-| `basic-blocks <addr> [--format dot] [--out F]` | CFG / basic blocks |
-| `bytes <addr> <size>` | Read raw bytes |
-| `find_pattern "48 8B ? ?" --max N` | Byte pattern search |
-| `search-const 0x1234 --max N` | Search constant values |
-| `search-code "keyword" --max N` | Search in decompiled pseudocode |
-| `strings-xrefs --filter X --max N` | Strings + referencing functions |
-| `data-refs [--segment .data] [--filter X]` | Data reference analysis |
-| `func-similarity <addrA> <addrB>` | Compare two functions |
-| `comments <addr>` | Get comments at address |
+# Data collection (use --out to save context window space)
+ida-cli -b <hint> functions [--filter X] [--count N] [--offset N] [--out F]
+ida-cli -b <hint> strings [--filter X] [--count N] [--offset N] [--out F]
+ida-cli -b <hint> imports [--filter X] [--count N] [--out F]
+ida-cli -b <hint> exports [--out F]
+```
+
+### Decompilation & Disassembly
+```bash
+# Decompile (--out suppresses inline output, saves to file only)
+ida-cli -b <hint> decompile <addr|name> [--out /tmp/func.c]
+ida-cli -b <hint> decompile <addr|name> --with-xrefs    # Include callers/callees
+ida-cli -b <hint> decompile <addr|name> --out result.md  # Markdown output
+
+# Batch decompile (--out suppresses inline output)
+ida-cli -b <hint> decompile_batch <a1> <a2> ... [--out /tmp/batch.c]
+ida-cli -b <hint> decompile_batch <a1> <a2> --out batch.md  # Markdown output
+
+# Decompile all functions to file
+ida-cli -b <hint> decompile-all --out /tmp/all.c [--filter X]
+  # Options: --include-thunks, --include-libs
+
+# Disassembly
+ida-cli -b <hint> disasm <addr|name> --count 50
+```
+
+### Function Analysis
+```bash
+ida-cli -b <hint> find_func <name> [--regex]       # Find function by name/regex
+ida-cli -b <hint> func_info <addr|name>             # Function details (size, args, type)
+ida-cli -b <hint> func-similarity <addrA> <addrB>   # Compare two functions by similarity
+ida-cli -b <hint> auto-rename [--apply] [--max-funcs 200]  # Heuristic rename sub_ functions
+```
+
+### Cross-References
+```bash
+ida-cli -b <hint> xrefs <addr> --direction to|from|both
+ida-cli -b <hint> cross-refs <addr|name> --depth 3 --direction to|from|both
+  # Options: --format mermaid|dot, --out F
+```
+
+### Call Graph & Control Flow
+```bash
+# Call graph (mermaid or DOT format)
+ida-cli -b <hint> callgraph <addr|name> --depth 3 --direction callers|callees
+ida-cli -b <hint> callgraph <addr> --format dot --out graph.dot
+
+# Basic blocks + CFG
+ida-cli -b <hint> basic-blocks <addr|name>
+ida-cli -b <hint> basic-blocks <addr> --format dot --out cfg.dot
+ida-cli -b <hint> basic-blocks <addr> --graph-only   # Graph output only
+```
+
+### Search
+```bash
+ida-cli -b <hint> search-code "keyword" --max 10      # Search in decompiled pseudocode
+  # Options: --max-funcs N (limit functions to scan)
+ida-cli -b <hint> search-const 0x1234 --max 20         # Search constant/immediate values
+ida-cli -b <hint> find_pattern "48 8B ? ? 00" --max 20 # Byte pattern search
+ida-cli -b <hint> strings-xrefs --filter http --max 20  # Strings + referencing functions
+  # Options: --min-refs N, --out F
+ida-cli -b <hint> data-refs --max 50                    # Data segment reference analysis
+  # Options: --segment .data, --filter X
+```
+
+### Raw Data
+```bash
+ida-cli -b <hint> bytes <addr> <size>     # Read raw bytes (hex + base64)
+ida-cli -b <hint> comments <addr>          # Get comments at address
+```
 
 ### Types & Structures
-| Command | Description |
-|---------|-------------|
-| `type-info list [--kind typedef\|funcptr\|struct\|enum]` | List local types |
-| `type-info show <name>` | Show type details |
-| `structs list [--filter X] [--count N] [--offset N]` | List structs |
-| `structs show <name>` | Show struct members |
-| `structs create <name> --members "f1:4" "f2:8"` | Create struct |
-| `enums list [--filter X] [--count N] [--offset N]` | List enums |
-| `enums show <name>` | Show enum members |
-| `enums create <name> --members "OK=0" "ERR=1"` | Create enum |
-| `vtables [--min-entries 3]` | Detect virtual function tables |
-| `sigs list` / `sigs apply <name>` | FLIRT signatures |
+```bash
+# Local types
+ida-cli -b <hint> type-info list [--kind typedef|funcptr|struct|enum|other]
+ida-cli -b <hint> type-info show <type_name>
+
+# Structs
+ida-cli -b <hint> structs list [--filter X] [--count N] [--offset N]
+ida-cli -b <hint> structs show <struct_name>
+ida-cli -b <hint> structs create <name> --members "field1:4" "field2:8"
+
+# Enums
+ida-cli -b <hint> enums list [--filter X] [--count N] [--offset N]
+ida-cli -b <hint> enums show <enum_name>
+ida-cli -b <hint> enums create <name> --members "OK=0" "ERR=1"
+
+# VTable detection
+ida-cli -b <hint> vtables [--min-entries 3]
+
+# FLIRT signatures
+ida-cli -b <hint> sigs list
+ida-cli -b <hint> sigs apply <sig_name>
+```
 
 ### Modification
-| Command | Description |
-|---------|-------------|
-| `rename <addr> <new_name>` | Rename symbol |
-| `set_type <addr> "type_string"` | Set function/variable type |
-| `comment <addr> "text"` | Set comment |
-| `patch <addr> 90 90 90` | Patch bytes (requires exec_enabled) |
-| `auto-rename [--apply] [--max-funcs N]` | Heuristic rename sub_ functions |
-| `save` | Save IDB |
+```bash
+ida-cli -b <hint> rename <addr> <new_name>
+ida-cli -b <hint> set_type <addr> "int __fastcall func(int a, int b)"
+ida-cli -b <hint> comment <addr> "description text"
+ida-cli -b <hint> patch <addr> 90 90 90               # NOP patch (requires exec_enabled)
+ida-cli -b <hint> save                                 # Save IDB
+```
+> **Iterative analysis**: After rename/set_type, decompile again --
+> variable names and types will be reflected, producing much more readable code.
 
-### Persistence & Reporting
-| Command | Description |
-|---------|-------------|
-| `annotations export --output F.json` | Export names/comments/types |
-| `annotations import F.json` | Import annotations |
-| `snapshot save [--description "..."]` | Save IDB snapshot |
-| `snapshot list` / `snapshot restore <file>` | Manage snapshots |
-| `export-script --output F.py` | Generate IDAPython script |
-| `report output.md [--functions addr1 addr2]` | Generate report |
-| `bookmark add <addr> <tag> --note "..."` | Tag addresses |
-| `profile run malware\|firmware\|vuln` | Run analysis profile |
+### Annotations & Snapshots
+```bash
+# Export/import all names/comments/types as JSON
+ida-cli -b <hint> annotations export --output analysis.json
+ida-cli -b <hint> annotations import analysis.json
 
-### Advanced
-| Command | Description |
-|---------|-------------|
-| `exec "python_code"` | Execute IDA Python (requires exec_enabled) |
-| `batch <dir> --idb-dir . --timeout N` | Batch analyze directory |
-| `compare old.exe new.exe --out diff.json` | Binary diff |
-| `code-diff <instA> <instB>` | Decompiled code diff |
+# IDB snapshots (backup before experimental changes)
+ida-cli -b <hint> snapshot save --description "before refactoring"
+ida-cli -b <hint> snapshot list                        # Shows description from .meta.json
+ida-cli -b <hint> snapshot restore <snapshot_file>     # Auto-resolves from IDB dir
 
-## Key Options
+# Generate IDAPython script (reproducible analysis)
+ida-cli -b <hint> export-script --output analysis.py
+```
 
-- `-b <hint>` — Select instance by binary name substring (e.g., `-b note` for notepad.exe)
-- `--out <path>` — Save output to file (suppresses inline display, saves context)
-- `--count N` / `--offset N` — Pagination
-- `--filter <keyword>` — Filter results by name
-- `--format mermaid|dot` — Graph output format
-- `--json` — JSON output mode
-- `--fresh` — Ignore existing .i64, reanalyze from scratch
-- `--force` — Allow duplicate instances
+### Bookmarks (address tagging across sessions)
+```bash
+ida-cli bookmark add <addr> <tag> --note "description" -b <hint>
+ida-cli bookmark list
+ida-cli bookmark list --tag vuln
+ida-cli bookmark remove <addr>
+```
+> Saved as `.ida-bookmarks.json` in the project directory.
+
+### Report Generation
+```bash
+ida-cli -b <hint> report output.md                     # Markdown report
+ida-cli -b <hint> report output.html                   # HTML report
+ida-cli -b <hint> report output.md --functions 0x401000 0x402000  # Include decompilations
+```
+> Reports include: summary, segments, imports, exports, strings, bookmarks, optional functions.
+
+### Batch & Profile Analysis
+```bash
+# Batch analyze all binaries in directory
+ida-cli batch <directory> --idb-dir . --timeout 300
+
+# Automated analysis profiles
+ida-cli -b <hint> profile run malware
+ida-cli -b <hint> profile run vuln
+ida-cli -b <hint> profile run firmware
+```
+
+### Binary Comparison (Patch Diffing)
+```bash
+ida-cli -b <hint> compare old.exe new.exe --out diff.json
+ida-cli -b <hint> code-diff <instanceA> <instanceB> [--functions func1 func2]
+ida-cli -b <hint> diff                                 # Compare two running instances
+```
+
+### IDA Python Execution
+```bash
+# Requires security.exec_enabled=true in shared/config.json
+ida-cli -b <hint> exec "import idautils; print(len(list(idautils.Functions())))"
+ida-cli -b <hint> exec "import idc; print(idc.get_segm_name(0x140001000))"
+ida-cli -b <hint> shell                                # Interactive IDA Python REPL
+```
+
+### Utility
+```bash
+ida-cli -b <hint> methods                              # List available RPC methods
+ida-cli update                                         # Update tool from git
+ida-cli completions --shell bash|zsh|fish|powershell   # Generate shell completions
+```
+
+## Key Global Options
+
+- `-b <hint>` -- Select instance by binary name substring (e.g., `-b note` for notepad.exe)
+- `-i <id>` -- Select instance by ID
+- `--out <path>` -- Save output to file (decompile/decompile_batch suppress inline output)
+- `--count N` / `--offset N` -- Pagination for large result sets
+- `--filter <keyword>` -- Filter results by name substring
+- `--format mermaid|dot` -- Graph output format (callgraph, cross-refs, basic-blocks)
+- `--json` -- JSON output mode
+- `--fresh` -- Ignore existing .i64, reanalyze from scratch
+- `--force` -- Allow duplicate instances of same binary
+
+## Multi-Instance Workflow
+
+```bash
+# Start multiple binaries simultaneously
+ida-cli start ./main_binary --idb-dir .
+ida-cli start ./libcrypto.so --idb-dir .
+
+# Target each instance with -b hint
+ida-cli -b main decompile 0x401000
+ida-cli -b crypto decompile 0x12340
+
+# Check all instances
+ida-cli list
+ida-cli list --json
+```
 
 ## Analysis Strategies
 
@@ -151,30 +281,39 @@ Search strings/imports for: root, jailbreak, ssl, cert, integrity, frida, xposed
 1. `strings` for C2, IPs, registry keys, file paths
 2. `imports` for networking, process injection, file APIs
 3. `find_func --regex "crypt|encode|decode|xor"` for crypto
-4. `find_pattern` for hardcoded keys/IVs
+4. `decompile_batch` for bulk analysis of suspicious functions
+5. `find_pattern` for hardcoded keys/IVs/XOR tables
 
 ### Vulnerability Research
-1. `imports` for dangerous functions (memcpy, strcpy, sprintf, system)
-2. `xrefs` on each -> find call sites
+1. `imports` for dangerous functions (memcpy, strcpy, sprintf, system, exec)
+2. `xrefs` on each dangerous function -> find call sites
 3. `decompile` to check buffer sizes, input validation
+4. `func_info` to check function size and arguments
+5. `bytes` to verify stack buffer sizes and offsets
 
 ### Firmware/IoT
-1. `segments` for memory layout (ROM/RAM)
-2. `find_func --regex "uart|spi|i2c|gpio"` for HW interfaces
-3. `exports` for entry points
+1. `segments` for memory layout (ROM/RAM regions)
+2. `strings` for device identifiers, commands, protocol keywords
+3. `find_func --regex "uart|spi|i2c|gpio"` for HW interface functions
+4. `exports` for public symbols / entry points
+5. `find_pattern` for magic bytes / struct headers
 
 ## Context Efficiency Tips
 
-- Use `--out /tmp/file` to save large results to file, then `Read` the file
+- Use `--out /tmp/file` to save large results, then `Read` the file
+- decompile/decompile_batch with `--out` suppress inline output (saves context)
 - Use `--count` and `--filter` to limit output scope
+- Use `--offset` for pagination (browsing large function lists)
 - Use `summary` instead of separate segments + imports + strings calls
 - Use `decompile_batch` instead of multiple single decompile calls
 - Use `profile run <type>` for automated reconnaissance
+- Use `--json` mode for structured/machine-readable data
 
 ## Error Handling
 
 - Analysis failure: `logs <id> --tail 20`
-- Locked .i64 (`open_database returned 2`): delete .i64, restart with `--fresh`
+- Locked/corrupted .i64 (`open_database returned 2`): delete .i64, restart with `--fresh`
+- Rebuild .i64: `start <binary> --fresh`
 - Instance issues: `list` then `cleanup`
 
 ## Tool Selection
