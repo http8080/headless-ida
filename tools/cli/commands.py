@@ -514,7 +514,7 @@ def cmd_proxy_summary(args, config):
     print()
     print("  Segments:")
     for s in r.get("segments", []):
-        print(f"    {s['start']}-{s['end']}  {s.get('name', ''):<12}  "
+        print(f"    {s['start_addr']}-{s['end_addr']}  {s.get('name', ''):<12}  "
               f"size={s['size']:<8}  {s['perm']}")
     if r.get("top_import_modules"):
         print()

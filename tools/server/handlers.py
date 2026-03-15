@@ -375,20 +375,8 @@ def _extract_type_info(func_start_ea):
 
 
 def _get_segments_info():
-    """Collect segment information."""
-    import idautils, ida_segment
-    segments = []
-    for ea in idautils.Segments():
-        seg = ida_segment.getseg(ea)
-        if seg:
-            segments.append({
-                "name": ida_segment.get_segm_name(seg),
-                "start": _fmt_addr(seg.start_ea),
-                "end": _fmt_addr(seg.end_ea),
-                "size": seg.size(),
-                "perm": _perm_str(seg.perm),
-            })
-    return segments
+    """Collect segment information (reuses _handle_get_segments)."""
+    return _handle_get_segments({}).get("data", [])
 
 
 def _get_imports_summary():

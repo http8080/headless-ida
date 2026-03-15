@@ -554,7 +554,7 @@ def _md_summary(r):
     if r.get("segments"):
         lines += ["", "## Segments"] + _md_table_header("Name", "Start", "End", "Size", "Perm")
         for s in r["segments"]:
-            lines.append(f"| {s.get('name', '')} | `{s.get('start', '')}` | `{s.get('end', '')}` | {s.get('size', '')} | {s.get('perm', '')} |")
+            lines.append(f"| {s.get('name', '')} | `{s.get('start_addr', '')}` | `{s.get('end_addr', '')}` | {s.get('size', '')} | {s.get('perm', '')} |")
     if r.get("top_import_modules"):
         lines += ["", "## Top Import Modules"]
         for m in r["top_import_modules"]:
