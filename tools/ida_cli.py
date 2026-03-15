@@ -376,7 +376,7 @@ def _register_instance(config, instance_id, binary_path, arch_info,
         release_lock()
 
 
-def _spawn_server(config_path, binary_path, instance_id, idb_path, log_path, fresh):
+def _spawn_server(config, config_path, binary_path, instance_id, idb_path, log_path, fresh):
     """Start ida_server.py as a detached process."""
     server_script = os.path.join(_SCRIPT_DIR, "ida_server.py")
     cmd = [sys.executable, server_script, binary_path,
@@ -387,8 +387,10 @@ def _spawn_server(config_path, binary_path, instance_id, idb_path, log_path, fre
     flags = 0
     if sys.platform == "win32":
         flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    env = os.environ.copy()
+    env["IDADIR"] = config["ida"]["install_dir"]
     return subprocess.Popen(
-        cmd, creationflags=flags,
+        cmd, creationflags=flags, env=env,
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
@@ -435,7 +437,7 @@ def cmd_start(args, config, config_path):
                                idb_path, log_path, force):
         return
 
-    proc = _spawn_server(config_path, binary_path, instance_id, idb_path, log_path, fresh)
+    proc = _spawn_server(config, config_path, binary_path, instance_id, idb_path, log_path, fresh)
     state = _wait_for_start(instance_id)
 
     fmt = arch_info.get("file_format", "?")
