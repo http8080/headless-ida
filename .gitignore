@@ -16,8 +16,18 @@ __pycache__/
 *.stderr
 auth_token
 
+# IDA snapshots & metadata
+*.i64.snapshot_*
+*.i64.before_restore_*
+*.i64.meta.json
+
 # Project-local data
 .ida-bookmarks.json
 
-# Sample binaries
+# Sample/test binaries (keep repo clean)
 samples/
+*.exe
+*.dll
+*.so
+*.dylib
+*.elf

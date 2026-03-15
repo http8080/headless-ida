@@ -97,12 +97,12 @@ python tools/ida_cli.py sigs apply <name>
 ### 리포트 & 내보내기
 ```bash
 python tools/ida_cli.py report <output.md|.html> [--functions <addrs>]
-python tools/ida_cli.py annotations export --output <file>
+python tools/ida_cli.py annotations export --out <file>
 python tools/ida_cli.py annotations import <file>
 python tools/ida_cli.py snapshot save [--description TEXT]
 python tools/ida_cli.py snapshot list
 python tools/ida_cli.py snapshot restore <filename>
-python tools/ida_cli.py export-script --output <file>
+python tools/ida_cli.py export-script --out <file>
 python tools/ida_cli.py bookmark add <addr> <tag> [--note TEXT]
 python tools/ida_cli.py bookmark list [--tag TAG]
 python tools/ida_cli.py bookmark remove <addr>
