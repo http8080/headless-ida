@@ -61,7 +61,7 @@ ida-cli -b <hint> functions --offset 100 --count 100
 # Find function
 ida-cli -b <hint> find_func <name> [--regex]
 
-# Decompile
+# Decompile (--out suppresses inline output, saves to file only)
 ida-cli -b <hint> decompile <addr|name> [--out /tmp/func.c]
 
 # Decompile with xrefs (include callers/callees)
@@ -211,6 +211,7 @@ ida-cli -b crypto decompile 0x12340
 
 # Check instance list
 ida-cli list
+ida-cli list --json
 ```
 
 ## Analysis Strategies
@@ -251,10 +252,11 @@ The fastest way to reach target code:
 5. `find_pattern` for hardcoded keys/IVs/XOR tables
 
 ### Handling Large Results
-- Always save to file with `--out`, then read with Read tool
+- Use `--out` to save to file (decompile/decompile_batch suppress inline output)
 - Limit result scope with `--count`, `--filter`
 - Use `--offset` for pagination (browsing large function lists)
 - Use `--json` mode for structured data
+- Use `list --json` for machine-readable instance info
 
 ## Batch Analysis
 ```bash

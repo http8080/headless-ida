@@ -61,7 +61,7 @@ ida-cli -b <hint> functions --offset 100 --count 100
 # 함수 찾기
 ida-cli -b <hint> find_func <이름> [--regex]
 
-# 디컴파일
+# 디컴파일 (--out 사용 시 inline 출력 생략, 파일만 저장)
 ida-cli -b <hint> decompile <주소|이름> [--out /tmp/func.c]
 
 # 디컴파일 + xrefs (호출자/피호출자 정보 포함)
@@ -210,6 +210,7 @@ ida-cli -b crypto decompile 0x12340
 
 # 인스턴스 목록 확인
 ida-cli list
+ida-cli list --json
 ```
 
 ## 분석 전략
@@ -250,10 +251,11 @@ ida-cli list
 5. `find_pattern`으로 하드코딩된 키/IV/XOR 테이블 검색
 
 ### 대용량 결과 처리
-- 항상 `--out` 옵션으로 파일 저장 후 Read로 읽기
+- `--out` 옵션으로 파일 저장 (decompile/decompile_batch는 inline 출력 생략)
 - `--count`, `--filter`로 결과 범위 제한
 - `--offset`으로 페이징 (대량 함수 탐색 시)
 - `--json` 모드로 구조화된 데이터 활용
+- `list --json`으로 인스턴스 정보를 JSON 출력
 
 ## 일괄 분석
 ```bash
