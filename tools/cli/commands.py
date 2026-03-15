@@ -203,7 +203,7 @@ def cmd_list(args, config):
                 "binary": info.get("binary", "?"),
                 "port": info.get("port"),
                 "pid": info.get("pid"),
-                "idb": info.get("idb"),
+                "idb": info.get("idb_path"),
             }
         print(json.dumps(out, indent=2))
         return
@@ -357,11 +357,11 @@ def cmd_proxy_decompile(args, config):
             output += f"\n\n// --- Callees ({len(callees)}) ---"
             for c in callees:
                 output += f"\n//   {c['to_addr']}  {c['to_name']:<30}  [{c['type']}]"
-    if not r.get("saved_to"):
-        output, _ = _check_inline_limit(output, config)
-    print(output)
     if r.get("saved_to"):
-        print(f"\n// Saved to: {r['saved_to']}")
+        _log_ok(f"Saved to: {r['saved_to']}")
+    else:
+        output, _ = _check_inline_limit(output, config)
+        print(output)
 
 
 def cmd_proxy_decompile_batch(args, config):
@@ -380,10 +380,13 @@ def cmd_proxy_decompile_batch(args, config):
             lines.append(func["code"])
         else:
             lines.append(f"\n// -- {func.get('addr', '?')} -- ERROR: {func.get('error', '?')}")
-    output = "\n".join(lines)
-    if not r.get("saved_to"):
+    if r.get("saved_to"):
+        print(lines[0])  # summary line only
+        _log_ok(f"Saved to: {r['saved_to']}")
+    else:
+        output = "\n".join(lines)
         output, _ = _check_inline_limit(output, config)
-    print(output)
+        print(output)
 
 
 def cmd_proxy_disasm(args, config):
