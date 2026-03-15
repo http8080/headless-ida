@@ -132,10 +132,10 @@ ida-cli -b <hint> search-code "LoadString" --max 10
 ida-cli -b <hint> search-code "memcpy" --max-funcs 1000
 
 # 구조체/열거형 관리
-ida-cli -b <hint> structs list [--filter 이름]
+ida-cli -b <hint> structs list [--filter 이름] [--count N] [--offset N]
 ida-cli -b <hint> structs show <구조체_이름>
 ida-cli -b <hint> structs create <이름> --members "field1:4" "field2:8"
-ida-cli -b <hint> enums list [--filter 이름]
+ida-cli -b <hint> enums list [--filter 이름] [--count N] [--offset N]
 ida-cli -b <hint> enums show <열거형_이름>
 ida-cli -b <hint> enums create <이름> --members "OK=0" "ERR=1"
 

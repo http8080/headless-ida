@@ -132,10 +132,10 @@ ida-cli -b <hint> search-code "LoadString" --max 10
 ida-cli -b <hint> search-code "memcpy" --max-funcs 1000
 
 # Struct/enum management
-ida-cli -b <hint> structs list [--filter name]
+ida-cli -b <hint> structs list [--filter name] [--count N] [--offset N]
 ida-cli -b <hint> structs show <struct_name>
 ida-cli -b <hint> structs create <name> --members "field1:4" "field2:8"
-ida-cli -b <hint> enums list [--filter name]
+ida-cli -b <hint> enums list [--filter name] [--count N] [--offset N]
 ida-cli -b <hint> enums show <enum_name>
 ida-cli -b <hint> enums create <name> --members "OK=0" "ERR=1"
 
