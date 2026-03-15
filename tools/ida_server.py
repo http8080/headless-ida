@@ -376,6 +376,60 @@ def _handle_decompile(params):
             "code": code, "saved_to": saved_to}
 
 
+def _handle_decompile_with_xrefs(params):
+    """Decompile + xrefs_to in a single call."""
+    if not _decompiler_available:
+        raise RpcError("DECOMPILER_NOT_LOADED", "Decompiler plugin not available")
+    import ida_hexrays, idc, ida_funcs, idautils
+    ea = _resolve_addr(params.get("addr"))
+    func = ida_funcs.get_func(ea)
+    if not func:
+        raise RpcError("NOT_A_FUNCTION", f"No function at {_fmt_addr(ea)}")
+    try:
+        cfunc = ida_hexrays.decompile(func.start_ea)
+        if not cfunc:
+            raise RpcError("DECOMPILE_FAILED", f"Decompile returned None at {_fmt_addr(ea)}")
+        code = str(cfunc)
+    except ida_hexrays.DecompilationFailure as e:
+        raise RpcError("DECOMPILE_FAILED", str(e))
+    name = idc.get_func_name(func.start_ea) or ""
+    # Collect xrefs to this function
+    callers = []
+    for xref in idautils.XrefsTo(func.start_ea):
+        callers.append({
+            "from_addr": _fmt_addr(xref.frm),
+            "from_name": idc.get_func_name(xref.frm) or "",
+            "type": _xref_type_str(xref.type),
+        })
+    # Collect xrefs from this function (callees)
+    callees = []
+    seen = set()
+    for ea_item in idautils.FuncItems(func.start_ea):
+        for xref in idautils.XrefsFrom(ea_item):
+            target_func = ida_funcs.get_func(xref.to)
+            if target_func and target_func.start_ea != func.start_ea:
+                if target_func.start_ea not in seen:
+                    seen.add(target_func.start_ea)
+                    callees.append({
+                        "to_addr": _fmt_addr(target_func.start_ea),
+                        "to_name": idc.get_func_name(target_func.start_ea) or "",
+                        "type": _xref_type_str(xref.type),
+                    })
+    output = f"// {name} @ {_fmt_addr(func.start_ea)}\n{code}"
+    if callers:
+        output += f"\n\n// --- Callers ({len(callers)}) ---"
+        for c in callers:
+            output += f"\n//   {c['from_addr']}  {c['from_name']}  [{c['type']}]"
+    if callees:
+        output += f"\n\n// --- Callees ({len(callees)}) ---"
+        for c in callees:
+            output += f"\n//   {c['to_addr']}  {c['to_name']}  [{c['type']}]"
+    saved_to = _save_output(params.get("output"), output)
+    return {"addr": _fmt_addr(func.start_ea), "name": name,
+            "code": code, "callers": callers, "callees": callees,
+            "saved_to": saved_to}
+
+
 def _handle_decompile_batch(params):
     if not _decompiler_available:
         raise RpcError("DECOMPILER_NOT_LOADED", "Decompiler plugin not available")
@@ -540,6 +594,87 @@ def _extract_type_info(func_start_ea):
         pass
 
     return result
+
+
+def _handle_summary(params):
+    """Return a comprehensive binary overview in one call."""
+    import idc, idautils, ida_funcs, ida_nalt, ida_segment, ida_kernwin, ida_loader
+    # Basic info
+    func_count = sum(1 for _ in idautils.Functions())
+    idb = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+    # Segments
+    segments = []
+    for ea in idautils.Segments():
+        seg = ida_segment.getseg(ea)
+        if seg:
+            segments.append({
+                "name": ida_segment.get_segm_name(seg),
+                "start": _fmt_addr(seg.start_ea),
+                "end": _fmt_addr(seg.end_ea),
+                "size": seg.size(),
+                "perm": _perm_str(seg.perm),
+            })
+    # Top imports (grouped by module)
+    import_modules = {}
+    for i in range(ida_nalt.get_import_module_qty()):
+        mod = ida_nalt.get_import_module_name(i) or ""
+        count = [0]
+        def cb(ea, name, ordinal, _c=count):
+            _c[0] += 1
+            return True
+        ida_nalt.enum_import_names(i, cb)
+        import_modules[mod] = count[0]
+    top_imports = sorted(import_modules.items(), key=lambda x: -x[1])[:10]
+    total_imports = sum(import_modules.values())
+    # Top strings
+    top_count = int(params.get("string_count", 20))
+    strings_sample = []
+    for i, s in enumerate(idautils.Strings()):
+        if i >= top_count:
+            break
+        val = idc.get_strlit_contents(s.ea, s.length, s.strtype)
+        if val:
+            try:
+                decoded = val.decode("utf-8", errors="replace")
+            except Exception:
+                decoded = val.hex()
+            strings_sample.append({"addr": _fmt_addr(s.ea), "value": decoded[:100]})
+    total_strings = sum(1 for _ in idautils.Strings())
+    # Function size distribution
+    sizes = []
+    for ea in idautils.Functions():
+        func = ida_funcs.get_func(ea)
+        if func:
+            sizes.append(func.size())
+    sizes.sort(reverse=True)
+    largest_funcs = []
+    for ea in idautils.Functions():
+        func = ida_funcs.get_func(ea)
+        if func and func.size() >= (sizes[9] if len(sizes) >= 10 else 0):
+            largest_funcs.append({
+                "addr": _fmt_addr(func.start_ea),
+                "name": idc.get_func_name(func.start_ea) or "",
+                "size": func.size(),
+            })
+            if len(largest_funcs) >= 10:
+                break
+    largest_funcs.sort(key=lambda x: -x["size"])
+    # Exports count
+    export_count = sum(1 for _ in idautils.Entries())
+    return {
+        "binary": os.path.basename(_binary_path),
+        "decompiler": _decompiler_available,
+        "ida_version": ida_kernwin.get_kernel_version(),
+        "func_count": func_count,
+        "total_strings": total_strings,
+        "total_imports": total_imports,
+        "export_count": export_count,
+        "segments": segments,
+        "top_import_modules": [{"module": m, "count": c} for m, c in top_imports],
+        "strings_sample": strings_sample,
+        "largest_functions": largest_funcs,
+        "avg_func_size": round(sum(sizes) / len(sizes)) if sizes else 0,
+    }
 
 
 def _handle_get_func_info(params):
@@ -722,7 +857,9 @@ _METHODS = {
     "get_exports": _handle_get_exports,
     "get_segments": _handle_get_segments,
     "decompile": _handle_decompile,
+    "decompile_with_xrefs": _handle_decompile_with_xrefs,
     "decompile_batch": _handle_decompile_batch,
+    "summary": _handle_summary,
     "disasm": _handle_disasm,
     "get_xrefs_to": _handle_get_xrefs_to,
     "get_xrefs_from": _handle_get_xrefs_from,
@@ -750,7 +887,9 @@ _METHOD_DESCRIPTIONS = [
     ("get_exports", "List exports"),
     ("get_segments", "List segments"),
     ("decompile", "Decompile a function"),
+    ("decompile_with_xrefs", "Decompile with caller/callee info"),
     ("decompile_batch", "Batch decompile multiple functions"),
+    ("summary", "Get comprehensive binary overview"),
     ("disasm", "Disassemble instructions"),
     ("get_xrefs_to", "Cross-references to an address"),
     ("get_xrefs_from", "Cross-references from an address"),

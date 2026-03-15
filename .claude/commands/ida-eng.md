@@ -36,7 +36,10 @@ ida-cli wait <id> --timeout 300
 ### 3. Initial Reconnaissance
 Survey the binary in this order:
 ```bash
-# Basic info
+# Comprehensive overview (segments, imports, functions, strings at once)
+ida-cli -b <hint> summary
+
+# Or query individually:
 ida-cli -b <hint> status
 ida-cli -b <hint> imagebase
 ida-cli -b <hint> segments
@@ -60,6 +63,9 @@ ida-cli -b <hint> find_func <name> [--regex]
 
 # Decompile
 ida-cli -b <hint> decompile <addr|name> [--out /tmp/func.c]
+
+# Decompile with xrefs (include callers/callees)
+ida-cli -b <hint> decompile <addr|name> --with-xrefs
 
 # Batch decompile
 ida-cli -b <hint> decompile_batch <addr1> <addr2> ... [--out /tmp/batch.c]

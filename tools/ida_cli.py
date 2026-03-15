@@ -281,6 +281,22 @@ def _rpc_call(args, config, method, params=None):
     resp = post_rpc(config, port, method, iid, params=params)
     if "error" in resp:
         err = resp["error"]
+        # Health check: if connection failed, check if process is alive
+        if err.get("code") == "CONNECTION_FAILED" and not _is_process_alive(info):
+            print(f"[-] Instance {iid} server process is dead (pid={info.get('pid')})")
+            binary = info.get("path")
+            if binary and os.path.isfile(binary):
+                print(f"[*] Cleaning up stale instance...")
+                if acquire_lock():
+                    try:
+                        r = load_registry()
+                        r.pop(iid, None)
+                        save_registry(r)
+                    finally:
+                        release_lock()
+                remove_auth_token(config["security"]["auth_token_file"], iid)
+                print(f"[*] Restart with: ida-cli start {binary}")
+            return None
         if getattr(args, 'json_output', False):
             print(json.dumps(resp, ensure_ascii=False, indent=2))
         else:
@@ -430,6 +446,8 @@ def cmd_start(args, config, config_path):
     force = getattr(args, 'force', False)
     fresh = getattr(args, 'fresh', False)
     idb_dir_override = getattr(args, 'idb_dir', None)
+    if not idb_dir_override:
+        idb_dir_override = os.environ.get('IDA_IDB_DIR')
     idb_path = get_idb_path(config, binary_path, instance_id, force, idb_dir=idb_dir_override)
 
     if os.path.exists(idb_path) and not fresh:
@@ -753,13 +771,26 @@ def cmd_proxy_segments(args, config):
 
 
 def cmd_proxy_decompile(args, config):
+    with_xrefs = getattr(args, 'with_xrefs', False)
     p = {"addr": args.addr}
     if getattr(args, 'out', None): p["output"] = args.out
-    r = _rpc_call(args, config, "decompile", p)
+    method = "decompile_with_xrefs" if with_xrefs else "decompile"
+    r = _rpc_call(args, config, method, p)
     if not r: return
     header = f"// {r.get('name', '')} @ {r.get('addr', '')}"
     code = r.get("code", "")
     output = f"{header}\n{code}"
+    if with_xrefs:
+        callers = r.get("callers", [])
+        callees = r.get("callees", [])
+        if callers:
+            output += f"\n\n// --- Callers ({len(callers)}) ---"
+            for c in callers:
+                output += f"\n//   {c['from_addr']}  {c['from_name']:<30}  [{c['type']}]"
+        if callees:
+            output += f"\n\n// --- Callees ({len(callees)}) ---"
+            for c in callees:
+                output += f"\n//   {c['to_addr']}  {c['to_name']:<30}  [{c['type']}]"
     if not r.get("saved_to"):
         output, _ = _check_inline_limit(output, config)
     print(output)
@@ -919,6 +950,213 @@ def cmd_proxy_exec(args, config):
         print(f"[stderr] {r['stderr']}", end="")
 
 
+def cmd_proxy_summary(args, config):
+    r = _rpc_call(args, config, "summary")
+    if not r: return
+    print(f"  Binary:      {r['binary']}")
+    print(f"  Decompiler:  {r['decompiler']}")
+    print(f"  IDA:         {r['ida_version']}")
+    print(f"  Functions:   {r['func_count']}  (avg size: {r['avg_func_size']} bytes)")
+    print(f"  Strings:     {r['total_strings']}")
+    print(f"  Imports:     {r['total_imports']}")
+    print(f"  Exports:     {r['export_count']}")
+    print()
+    print("  Segments:")
+    for s in r.get("segments", []):
+        print(f"    {s['start']}-{s['end']}  {s.get('name', ''):<12}  "
+              f"size={s['size']:<8}  {s['perm']}")
+    if r.get("top_import_modules"):
+        print()
+        print("  Top Import Modules:")
+        for m in r["top_import_modules"]:
+            print(f"    {m['module']:<30}  {m['count']} imports")
+    if r.get("largest_functions"):
+        print()
+        print("  Largest Functions:")
+        for f in r["largest_functions"]:
+            print(f"    {f['addr']}  {f['name']:<40}  {f['size']} bytes")
+    if r.get("strings_sample"):
+        print()
+        print(f"  Strings (first {len(r['strings_sample'])}):")
+        for s in r["strings_sample"]:
+            val = s["value"]
+            if len(val) > 60:
+                val = val[:57] + "..."
+            print(f"    {s['addr']}  {val}")
+
+
+def cmd_diff(args, config):
+    """Compare functions between two instances."""
+    registry = load_registry()
+    id_a = args.instance_a
+    id_b = args.instance_b
+
+    # Resolve by hint or ID
+    def resolve(hint):
+        if hint in registry:
+            return hint, registry[hint]
+        matches = [(k, v) for k, v in registry.items()
+                   if hint.lower() in v.get("binary", "").lower()]
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            print(f"[-] No instance matching '{hint}'")
+        else:
+            print(f"[-] Multiple instances match '{hint}':")
+            for k, v in matches:
+                print(f"  {k}  {v.get('binary', '?')}")
+        return None, None
+
+    iid_a, info_a = resolve(id_a)
+    if not iid_a: return
+    iid_b, info_b = resolve(id_b)
+    if not iid_b: return
+
+    # Get function lists from both
+    def get_funcs(iid, info):
+        port = info.get("port")
+        if not port:
+            print(f"[-] Instance {iid} has no port")
+            return None
+        resp = post_rpc(config, port, "get_functions", iid, {"count": 10000})
+        if "error" in resp:
+            print(f"[-] {iid}: {resp['error'].get('message')}")
+            return None
+        return {f["name"]: f for f in resp.get("result", {}).get("data", [])}
+
+    funcs_a = get_funcs(iid_a, info_a)
+    funcs_b = get_funcs(iid_b, info_b)
+    if funcs_a is None or funcs_b is None:
+        return
+
+    names_a = set(funcs_a.keys())
+    names_b = set(funcs_b.keys())
+    only_a = names_a - names_b
+    only_b = names_b - names_a
+    common = names_a & names_b
+    size_diff = []
+    for name in common:
+        sa = funcs_a[name].get("size", 0)
+        sb = funcs_b[name].get("size", 0)
+        if sa != sb:
+            size_diff.append((name, funcs_a[name]["addr"], sa, funcs_b[name]["addr"], sb))
+
+    bin_a = info_a.get("binary", "?")
+    bin_b = info_b.get("binary", "?")
+    print(f"  Comparing: {bin_a} ({iid_a}) vs {bin_b} ({iid_b})")
+    print(f"  Functions: {len(names_a)} vs {len(names_b)}")
+    print(f"  Common: {len(common)}, Only in A: {len(only_a)}, Only in B: {len(only_b)}, Size changed: {len(size_diff)}")
+
+    if only_a:
+        print(f"\n  Only in {bin_a}:")
+        for name in sorted(only_a)[:30]:
+            print(f"    {funcs_a[name]['addr']}  {name}")
+        if len(only_a) > 30:
+            print(f"    ... and {len(only_a) - 30} more")
+
+    if only_b:
+        print(f"\n  Only in {bin_b}:")
+        for name in sorted(only_b)[:30]:
+            print(f"    {funcs_b[name]['addr']}  {name}")
+        if len(only_b) > 30:
+            print(f"    ... and {len(only_b) - 30} more")
+
+    if size_diff:
+        size_diff.sort(key=lambda x: abs(x[4] - x[2]), reverse=True)  # sort by abs size diff
+        print(f"\n  Size changed ({len(size_diff)}):")
+        for name, addr_a, sa, addr_b, sb in size_diff[:30]:
+            delta = sb - sa
+            sign = "+" if delta > 0 else ""
+            print(f"    {addr_a}  {name:<40}  {sa} -> {sb} ({sign}{delta})")
+        if len(size_diff) > 30:
+            print(f"    ... and {len(size_diff) - 30} more")
+
+
+def cmd_update(args):
+    """Self-update from git repository."""
+    repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    git_dir = os.path.join(repo_dir, ".git")
+    if not os.path.isdir(git_dir):
+        print(f"[-] Not a git repository: {repo_dir}")
+        return
+    print(f"[*] Updating from: {repo_dir}")
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo_dir, "pull", "--ff-only"],
+            capture_output=True, text=True, timeout=30,
+        )
+        print(result.stdout.strip())
+        if result.returncode != 0:
+            print(f"[-] {result.stderr.strip()}")
+    except FileNotFoundError:
+        print("[-] git not found in PATH")
+    except subprocess.TimeoutExpired:
+        print("[-] git pull timed out")
+
+
+def cmd_completions(args):
+    """Generate shell completion scripts."""
+    shell = getattr(args, 'shell', 'bash')
+    commands = [
+        "start", "stop", "status", "wait", "list", "logs", "cleanup",
+        "functions", "strings", "imports", "exports", "segments",
+        "decompile", "decompile_batch", "disasm", "xrefs",
+        "find_func", "func_info", "imagebase", "bytes", "find_pattern",
+        "comments", "methods", "rename", "set_type", "comment",
+        "save", "exec", "summary", "diff", "update", "completions",
+    ]
+    if shell == "bash":
+        print("""# ida-cli bash completion
+# Add to ~/.bashrc: eval "$(ida-cli completions --shell bash)"
+_ida_cli() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local commands="%s"
+    local opts="--json --config -i -b --init --check"
+    if [ $COMP_CWORD -eq 1 ]; then
+        COMPREPLY=( $(compgen -W "$commands $opts" -- "$cur") )
+    else
+        case "${COMP_WORDS[1]}" in
+            start)  COMPREPLY=( $(compgen -f -- "$cur") $(compgen -W "--fresh --force --idb-dir --arch" -- "$cur") ) ;;
+            decompile) COMPREPLY=( $(compgen -W "--out --with-xrefs" -- "$cur") ) ;;
+            functions|strings|imports|exports) COMPREPLY=( $(compgen -W "--offset --count --filter --out" -- "$cur") ) ;;
+            *)  COMPREPLY=( $(compgen -W "$opts" -- "$cur") ) ;;
+        esac
+    fi
+}
+complete -F _ida_cli ida-cli""" % " ".join(commands))
+    elif shell == "zsh":
+        print("""# ida-cli zsh completion
+# Add to ~/.zshrc: eval "$(ida-cli completions --shell zsh)"
+_ida_cli() {
+    local commands=(%s)
+    local opts=(--json --config -i -b --init --check)
+    if (( CURRENT == 2 )); then
+        _describe 'command' commands
+        _describe 'option' opts
+    else
+        case $words[2] in
+            start)  _files; _arguments '--fresh' '--force' '--idb-dir' '--arch' ;;
+            decompile) _arguments '--out' '--with-xrefs' ;;
+            functions|strings|imports|exports) _arguments '--offset' '--count' '--filter' '--out' ;;
+        esac
+    fi
+}
+compdef _ida_cli ida-cli""" % " ".join(commands))
+    elif shell == "powershell":
+        cmds_str = "', '".join(commands)
+        print(f"""# ida-cli PowerShell completion
+# Add to $PROFILE: . <(ida-cli completions --shell powershell)
+Register-ArgumentCompleter -CommandName ida-cli -Native -ScriptBlock {{
+    param($wordToComplete, $commandAst, $cursorPosition)
+    $commands = @('{cmds_str}')
+    $commands | Where-Object {{ $_ -like "$wordToComplete*" }} | ForEach-Object {{
+        [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
+    }}
+}}""")
+    else:
+        print(f"[-] Unsupported shell: {shell}. Use bash, zsh, or powershell.")
+
+
 # ─────────────────────────────────────────────
 # Dispatch
 # ─────────────────────────────────────────────
@@ -950,6 +1188,10 @@ def _build_dispatch(args, config, config_path):
         "comment": lambda: cmd_proxy_comment(args, config),
         "save": lambda: cmd_proxy_save(args, config),
         "exec": lambda: cmd_proxy_exec(args, config),
+        "summary": lambda: cmd_proxy_summary(args, config),
+        "diff": lambda: cmd_diff(args, config),
+        "update": lambda: cmd_update(args),
+        "completions": lambda: cmd_completions(args),
     }
     for cmd_name, (method, header_fn, format_fn) in _LIST_COMMANDS.items():
         d[cmd_name] = (lambda m=method, h=header_fn, f=format_fn:
@@ -1017,6 +1259,7 @@ def main():
     p = sub.add_parser("decompile", parents=[common])
     p.add_argument("addr")
     p.add_argument("--out", default=None)
+    p.add_argument("--with-xrefs", action="store_true", help="Include caller/callee xrefs")
 
     p = sub.add_parser("decompile_batch", parents=[common])
     p.add_argument("addrs", nargs="+")
@@ -1074,6 +1317,17 @@ def main():
     p = sub.add_parser("exec", parents=[common])
     p.add_argument("code")
     p.add_argument("--out", default=None)
+
+    sub.add_parser("summary", help="Binary overview", parents=[common])
+
+    p = sub.add_parser("diff", help="Compare two instances", parents=[common])
+    p.add_argument("instance_a", help="Instance ID or binary hint")
+    p.add_argument("instance_b", help="Instance ID or binary hint")
+
+    sub.add_parser("update", help="Self-update from git")
+
+    p = sub.add_parser("completions", help="Generate shell completions")
+    p.add_argument("--shell", choices=["bash", "zsh", "powershell"], default="bash")
 
     args = parser.parse_args()
 

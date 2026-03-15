@@ -36,7 +36,10 @@ ida-cli wait <id> --timeout 300
 ### 3. 초기 정찰
 아래 순서로 바이너리 개요를 파악합니다:
 ```bash
-# 기본 정보
+# 종합 개요 (세그먼트, 임포트, 함수, 문자열 한번에 확인)
+ida-cli -b <hint> summary
+
+# 또는 개별 조회:
 ida-cli -b <hint> status
 ida-cli -b <hint> imagebase
 ida-cli -b <hint> segments
@@ -60,6 +63,9 @@ ida-cli -b <hint> find_func <이름> [--regex]
 
 # 디컴파일
 ida-cli -b <hint> decompile <주소|이름> [--out /tmp/func.c]
+
+# 디컴파일 + xrefs (호출자/피호출자 정보 포함)
+ida-cli -b <hint> decompile <주소|이름> --with-xrefs
 
 # 일괄 디컴파일
 ida-cli -b <hint> decompile_batch <addr1> <addr2> ... [--out /tmp/batch.c]
