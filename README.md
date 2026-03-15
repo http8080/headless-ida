@@ -200,6 +200,8 @@ Commands are primarily used by AI, listed here for reference.
 | `decompile_batch <addrs>` | Batch decompile multiple functions |
 | `disasm <addr\|name>` | Disassemble |
 | `xrefs <addr>` | Cross-references |
+| `callers <addr>` | Who calls this address (shortcut for xrefs --direction to) |
+| `callees <addr>` | What this function calls (shortcut for xrefs --direction from) |
 | `find_func <name>` | Search functions |
 | `func_info <addr\|name>` | Function details |
 | `imagebase` | Get image base address |
@@ -286,6 +288,8 @@ Commands are primarily used by AI, listed here for reference.
 | `-b <hint>` | Auto-select by binary name |
 | `--idb-dir <path>` | Save IDB to specified directory (or set `IDA_IDB_DIR` env var) |
 | `--with-xrefs` | Include callers/callees in decompile output |
+| `--raw` | Pure C code without header/address comments (decompile only) |
+| `--encoding unicode\|ascii` | Filter strings by encoding type |
 
 ### Supported Formats
 
@@ -497,6 +501,8 @@ shell/터미널 접근이 가능한 AI면 `ida_cli.py`를 직접 호출할 수 �
 | `decompile_batch <addrs>` | 여러 함수 일괄 디컴파일 |
 | `disasm <addr\|name>` | 디스어셈블 |
 | `xrefs <addr>` | 크로스 레퍼런스 |
+| `callers <addr>` | 이 주소를 호출하는 함수 (xrefs --direction to 단축) |
+| `callees <addr>` | 이 함수가 호출하는 함수 (xrefs --direction from 단축) |
 | `find_func <name>` | 함수 검색 |
 | `func_info <addr\|name>` | 함수 상세 정보 |
 | `imagebase` | 이미지 베이스 주소 |
@@ -583,6 +589,8 @@ shell/터미널 접근이 가능한 AI면 `ida_cli.py`를 직접 호출할 수 �
 | `-b <hint>` | 바이너리 이름으로 자동 선택 |
 | `--idb-dir <path>` | IDB 저장 디렉토리 지정 (`IDA_IDB_DIR` 환경변수로도 설정 가능) |
 | `--with-xrefs` | 디컴파일 시 호출자/피호출자 정보 포함 |
+| `--raw` | 순수 C 코드만 출력 (헤더/주소 주석 없음, decompile 전용) |
+| `--encoding unicode\|ascii` | 문자열 인코딩 타입 필터 |
 
 ### 지원 포맷
 
