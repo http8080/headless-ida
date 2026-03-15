@@ -56,8 +56,8 @@ ida-cli stop <id>
 ### Deep Analysis
 | Command | Description |
 |---------|-------------|
-| `decompile <addr\|name> [--out F] [--with-xrefs]` | Decompile function |
-| `decompile_batch <a1> <a2> ... [--out F]` | Batch decompile |
+| `decompile <addr\|name> [--out F] [--with-xrefs]` | Decompile (--out suppresses inline, saves only) |
+| `decompile_batch <a1> <a2> ... [--out F]` | Batch decompile (--out suppresses inline) |
 | `decompile-all --out F [--filter X]` | Decompile all functions |
 | `disasm <addr\|name> --count N` | Disassemble |
 | `find_func <name> [--regex]` | Find function by name |
