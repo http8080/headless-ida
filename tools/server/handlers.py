@@ -265,7 +265,7 @@ def _handle_disasm(params):
             break
         size = idc.get_item_size(cur) or 1  # prevent size 0
         raw = ida_bytes.get_bytes(cur, size)
-        hex_str = _bytes_to_hex(raw)
+        hex_str = _bytes_to_hex(raw) if raw else ""
         lines.append({"addr": _fmt_addr(cur), "bytes": hex_str, "insn": insn})
         cur += size
     text = "\n".join(f"{ln['addr']}  {ln['bytes']:<24}  {ln['insn']}" for ln in lines)
@@ -669,6 +669,8 @@ def _import_types(data, stats):
             if ok:
                 ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE)
                 stats["types"] += 1
+            else:
+                stats["errors"] += 1
         except Exception:
             stats["errors"] += 1
 
@@ -799,6 +801,8 @@ def _handle_patch_bytes(params):
         raise RpcError("INVALID_PARAMS", "Invalid hex string")
     # Read original bytes for undo info
     original = ida_bytes.get_bytes(ea, len(raw))
+    if original is None:
+        raise RpcError("READ_FAILED", f"Cannot read {len(raw)} bytes at {_fmt_addr(ea)}")
     orig_hex = _bytes_to_hex(original)
     for i, byte_val in enumerate(raw):
         ida_bytes.patch_byte(ea + i, byte_val)
@@ -839,7 +843,7 @@ def _handle_search_const(params):
                         results.append({
                             "addr": _fmt_addr(ea),
                             "func": (idc.get_func_name(ea) or "") if func else "",
-                            "disasm": idc.GetDisasm(ea),
+                            "disasm": idc.generate_disasm_line(ea, 0),
                         })
                         break
                 ea += length
