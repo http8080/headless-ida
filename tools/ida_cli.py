@@ -107,6 +107,12 @@ RPC_RETRY_DELAY = 1                 # seconds between retries
 PID_CREATE_TIME_TOLERANCE = 1.0     # seconds tolerance for PID create time
 
 
+def _make_args(**kwargs):
+    """Create a simple namespace object for passing to command functions."""
+    ns = type('Args', (), kwargs)()
+    return ns
+
+
 # ─────────────────────────────────────────────
 # Config (wrapper)
 # ─────────────────────────────────────────────
@@ -1611,6 +1617,71 @@ def cmd_profile(args, config):
             print(f"    Results saved to: {out_dir}")
 
 
+_REPORT_DATA_TABLES = [
+    ("Imports", "get_imports", 100,
+     ("Address", "Module", "Name"),
+     lambda d: f"| `{d['addr']}` | {d.get('module', '')} | {d['name']} |"),
+    ("Exports", "get_exports", 100,
+     ("Address", "Name"),
+     lambda d: f"| `{d['addr']}` | {d['name']} |"),
+    ("Strings", "get_strings", 50,
+     ("Address", "Value"),
+     lambda d: f"| `{d['addr']}` | {d.get('value', '').replace('|', chr(92)+'|')} |"),
+]
+
+
+def _collect_report_data(config, port, iid, sections):
+    """Collect imports/exports/strings into report sections."""
+    for label, method, count, headers, fmt_row in _REPORT_DATA_TABLES:
+        _log_info(f"Collecting {label.lower()}...")
+        resp = post_rpc(config, port, method, iid, {"count": count})
+        if "result" not in resp:
+            continue
+        data = resp["result"].get("data", [])
+        total = resp["result"].get("total", 0)
+        if not data:
+            continue
+        hdr = " | ".join(headers)
+        sep = " | ".join("---" for _ in headers)
+        sections += [f"## {label} ({total} total, showing {len(data)})",
+                     f"| {hdr} |", f"|{sep}|"]
+        for d in data:
+            sections.append(fmt_row(d))
+        sections.append("")
+
+
+def _collect_report_functions(config, port, iid, func_addrs, sections):
+    """Decompile specific functions into report sections."""
+    if not func_addrs:
+        return
+    sections += ["## Decompiled Functions", ""]
+    for addr in func_addrs:
+        _log_info(f"Decompiling {addr}...")
+        resp = post_rpc(config, port, "decompile_with_xrefs", iid, {"addr": addr})
+        if "result" in resp:
+            sections.append(_md_decompile(resp["result"], with_xrefs=True))
+        else:
+            err = resp.get("error", {}).get("message", "unknown error")
+            sections += [f"### `{addr}` - Error", f"> {err}"]
+        sections.append("")
+
+
+def _collect_report_bookmarks(binary_name, sections):
+    """Add bookmarks to report sections."""
+    bookmarks = _load_bookmarks()
+    if not bookmarks:
+        return
+    bm_for_binary = {bn: bms for bn, bms in bookmarks.items()
+                     if os.path.basename(binary_name).lower() in bn.lower()}
+    if bm_for_binary:
+        sections += ["## Bookmarks", "| Address | Tag | Note |", "|---------|-----|------|"]
+        for bms in bm_for_binary.values():
+            for bm in bms:
+                note = bm.get("note", "").replace("|", "\\|")
+                sections.append(f"| `{bm['addr']}` | {bm['tag']} | {note} |")
+        sections.append("")
+
+
 def _collect_report_sections(config, port, iid, binary_name, func_addrs):
     """Collect all report sections from the running instance."""
     import datetime
@@ -1627,64 +1698,21 @@ def _collect_report_sections(config, port, iid, binary_name, func_addrs):
     if "result" in resp:
         sections.append(_md_summary(resp["result"]))
 
-    # Imports / Exports / Strings
-    for label, method, count, fmt_row in [
-        ("Imports", "get_imports", 100,
-         lambda d: f"| `{d['addr']}` | {d.get('module', '')} | {d['name']} |"),
-        ("Exports", "get_exports", 100,
-         lambda d: f"| `{d['addr']}` | {d['name']} |"),
-        ("Strings", "get_strings", 50,
-         lambda d: f"| `{d['addr']}` | {d.get('value', '').replace('|', chr(92)+'|')} |"),
-    ]:
-        _log_info(f"Collecting {label.lower()}...")
-        resp = post_rpc(config, port, method, iid, {"count": count})
-        if "result" not in resp:
-            continue
-        data = resp["result"].get("data", [])
-        total = resp["result"].get("total", 0)
-        if not data:
-            continue
-        if label == "Imports":
-            sections += [f"## {label} ({total} total, showing {len(data)})",
-                         "| Address | Module | Name |", "|---------|--------|------|"]
-        elif label == "Exports":
-            sections += [f"## {label} ({total} total, showing {len(data)})",
-                         "| Address | Name |", "|---------|------|"]
-        else:
-            sections += [f"## {label} ({total} total, showing {len(data)})",
-                         "| Address | Value |", "|---------|-------|"]
-        for d in data:
-            sections.append(fmt_row(d))
-        sections.append("")
-
-    # Decompile specific functions
-    if func_addrs:
-        sections += ["## Decompiled Functions", ""]
-        for addr in func_addrs:
-            _log_info(f"Decompiling {addr}...")
-            resp = post_rpc(config, port, "decompile_with_xrefs", iid, {"addr": addr})
-            if "result" in resp:
-                sections.append(_md_decompile(resp["result"], with_xrefs=True))
-            else:
-                err = resp.get("error", {}).get("message", "unknown error")
-                sections += [f"### `{addr}` - Error", f"> {err}"]
-            sections.append("")
-
-    # Bookmarks
-    bookmarks = _load_bookmarks()
-    if bookmarks:
-        bm_for_binary = {bn: bms for bn, bms in bookmarks.items()
-                         if os.path.basename(binary_name).lower() in bn.lower()}
-        if bm_for_binary:
-            sections += ["## Bookmarks", "| Address | Tag | Note |", "|---------|-----|------|"]
-            for bms in bm_for_binary.values():
-                for bm in bms:
-                    note = bm.get("note", "").replace("|", "\\|")
-                    sections.append(f"| `{bm['addr']}` | {bm['tag']} | {note} |")
-            sections.append("")
+    _collect_report_data(config, port, iid, sections)
+    _collect_report_functions(config, port, iid, func_addrs, sections)
+    _collect_report_bookmarks(binary_name, sections)
 
     sections += ["---", "*Generated by ida-cli report*"]
     return "\n".join(sections) + "\n"
+
+
+_HTML_REPORT_STYLES = """\
+body { font-family: -apple-system, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; }
+table { border-collapse: collapse; width: 100%; margin: 10px 0; }
+th, td { border: 1px solid #ddd; padding: 6px 10px; text-align: left; }
+th { background: #f5f5f5; }
+pre, code { background: #f5f5f5; padding: 2px 6px; border-radius: 3px; }
+pre { padding: 12px; overflow-x: auto; }"""
 
 
 def _render_html(content, binary_name):
@@ -1694,18 +1722,11 @@ def _render_html(content, binary_name):
         html_body = markdown.markdown(content, extensions=["tables"])
     except ImportError:
         html_body = f"<pre>{content}</pre>"
-    return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Report: {os.path.basename(binary_name)}</title>
-<style>
-body {{ font-family: -apple-system, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; }}
-table {{ border-collapse: collapse; width: 100%; margin: 10px 0; }}
-th, td {{ border: 1px solid #ddd; padding: 6px 10px; text-align: left; }}
-th {{ background: #f5f5f5; }}
-pre, code {{ background: #f5f5f5; padding: 2px 6px; border-radius: 3px; }}
-pre {{ padding: 12px; overflow-x: auto; }}
-</style></head><body>
-{html_body}
-</body></html>"""
+    title = os.path.basename(binary_name)
+    return (f'<!DOCTYPE html>\n<html><head><meta charset="utf-8">'
+            f'<title>Report: {title}</title>\n'
+            f'<style>\n{_HTML_REPORT_STYLES}\n</style></head><body>\n'
+            f'{html_body}\n</body></html>')
 
 
 def cmd_report(args, config):
@@ -2029,15 +2050,10 @@ def cmd_compare(args, config, config_path):
     idb_dir = _opt(args, 'idb_dir') or os.environ.get("IDA_IDB_DIR") or "."
 
     _log_info("Starting instances...")
-    class FakeArgs:
-        def __init__(self, binary):
-            self.binary = binary
-            self.idb_dir = idb_dir
-            self.fresh = False
-            self.force = True
-            self.config = _opt(args, 'config')
-    cmd_start(FakeArgs(binary_a), config, config_path)
-    cmd_start(FakeArgs(binary_b), config, config_path)
+    cfg = _opt(args, 'config')
+    for binary in (binary_a, binary_b):
+        sa = _make_args(binary=binary, idb_dir=idb_dir, fresh=False, force=True, config=cfg)
+        cmd_start(sa, config, config_path)
 
     registry = load_registry()
     instances = [(iid, info, os.path.abspath(info.get("binary", "")))
@@ -2051,11 +2067,7 @@ def cmd_compare(args, config, config_path):
 
     _log_info("Waiting for analysis...")
     for iid, info, _ in instances:
-        class WaitArgs: pass
-        wa = WaitArgs()
-        wa.id = iid
-        wa.timeout = 300
-        cmd_wait(wa, config)
+        cmd_wait(_make_args(id=iid, timeout=300), config)
 
     ia, ib = instances[0], instances[1]
     funcs_a = _get_func_map(config, ia[0], ia[1])
@@ -2151,9 +2163,34 @@ def cmd_search_code(args, config):
 # Code-level Diff
 # ─────────────────────────────────────────────
 
+def _compute_code_diffs(config, func_names, port_a, port_b, iid_a, iid_b, bin_a, bin_b):
+    """Decompile and diff each function, return list of diffs."""
+    import difflib
+    all_diffs = []
+    for name in func_names:
+        resp_a = post_rpc(config, port_a, "decompile_diff", iid_a, {"addr": name})
+        resp_b = post_rpc(config, port_b, "decompile_diff", iid_b, {"addr": name})
+        if "error" in resp_a or "error" in resp_b:
+            _log_err(f"Cannot decompile: {name}")
+            continue
+        code_a = resp_a.get("result", {}).get("code", "")
+        code_b = resp_b.get("result", {}).get("code", "")
+        if code_a == code_b:
+            continue
+        diff = list(difflib.unified_diff(
+            code_a.splitlines(), code_b.splitlines(),
+            fromfile=f"{bin_a}:{name}", tofile=f"{bin_b}:{name}", lineterm="",
+        ))
+        if diff:
+            all_diffs.append({"name": name, "diff": diff})
+            print(f"\n  === {name} ===")
+            for line in diff:
+                print(f"  {line}")
+    return all_diffs
+
+
 def cmd_code_diff(args, config):
     """Compare decompiled code of same-named functions between two instances."""
-    import difflib
 
     id_a = args.instance_a
     id_b = args.instance_b
@@ -2194,28 +2231,8 @@ def cmd_code_diff(args, config):
     bin_a = os.path.basename(info_a.get("binary", "?"))
     bin_b = os.path.basename(info_b.get("binary", "?"))
 
-    for name in func_names:
-        resp_a = post_rpc(config, port_a, "decompile_diff", iid_a, {"addr": name})
-        resp_b = post_rpc(config, port_b, "decompile_diff", iid_b, {"addr": name})
-        if "error" in resp_a or "error" in resp_b:
-            print(f"  [-] Cannot decompile: {name}")
-            continue
-        code_a = resp_a.get("result", {}).get("code", "")
-        code_b = resp_b.get("result", {}).get("code", "")
-        if code_a == code_b:
-            continue
-
-        diff = list(difflib.unified_diff(
-            code_a.splitlines(), code_b.splitlines(),
-            fromfile=f"{bin_a}:{name}",
-            tofile=f"{bin_b}:{name}",
-            lineterm="",
-        ))
-        if diff:
-            all_diffs.append({"name": name, "diff": diff})
-            print(f"\n  === {name} ===")
-            for line in diff:
-                print(f"  {line}")
+    all_diffs = _compute_code_diffs(
+        config, func_names, port_a, port_b, iid_a, iid_b, bin_a, bin_b)
 
     if not all_diffs:
         print("  No code differences found")

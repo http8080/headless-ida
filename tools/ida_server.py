@@ -142,6 +142,53 @@ def save_db():
 # Helpers (addr resolution, pagination, xref)
 # ─────────────────────────────────────────────
 
+def _require_decompiler():
+    """Raise if decompiler is not available."""
+    if not _decompiler_available:
+        raise RpcError("DECOMPILER_NOT_LOADED", "Decompiler plugin not available")
+
+
+def _maybe_save_db():
+    """Save database if auto_save is enabled."""
+    if _config["analysis"]["auto_save"]:
+        save_db()
+
+
+def _require_param(params, key, msg=None):
+    """Get a required parameter or raise."""
+    val = params.get(key)
+    if not val:
+        raise RpcError("INVALID_PARAMS", msg or f"{key} parameter required")
+    return val
+
+
+def _clamp_int(params, key, default, max_val):
+    """Get an int parameter clamped to max_val."""
+    return min(int(params.get(key, default)), max_val)
+
+
+def _bytes_to_hex(raw):
+    """Format bytes as hex string."""
+    return " ".join(f"{b:02X}" for b in raw) if raw else ""
+
+
+def _parse_and_apply_type(ea, type_str):
+    """Parse a C type declaration and apply it to an address. Returns tinfo_t."""
+    import ida_typeinf
+    decl = type_str.rstrip(";") + ";"
+    tif = ida_typeinf.tinfo_t()
+    til = ida_typeinf.get_idati()
+    result = ida_typeinf.parse_decl(tif, til, decl, ida_typeinf.PT_SIL)
+    if result is None:
+        raise RpcError("PARSE_TYPE_FAILED",
+                        f"Cannot parse type declaration: {type_str}",
+                        suggestion="Use C syntax, e.g. 'int __fastcall foo(int a, char *b);'")
+    ok = ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE)
+    if not ok:
+        raise RpcError("SET_TYPE_FAILED", f"Cannot apply type at {_fmt_addr(ea)}")
+    return tif
+
+
 def _resolve_addr(addr_str):
     """Address string or symbol name → ea_t"""
     import idc
@@ -362,8 +409,7 @@ def _handle_get_segments(params):
 # ─────────────────────────────────────────────
 
 def _handle_decompile(params):
-    if not _decompiler_available:
-        raise RpcError("DECOMPILER_NOT_LOADED", "Decompiler plugin not available")
+    _require_decompiler()
     import ida_hexrays, idc, ida_funcs
     ea = _resolve_addr(params.get("addr"))
     func = ida_funcs.get_func(ea)
@@ -384,8 +430,7 @@ def _handle_decompile(params):
 
 def _handle_decompile_with_xrefs(params):
     """Decompile + xrefs_to in a single call."""
-    if not _decompiler_available:
-        raise RpcError("DECOMPILER_NOT_LOADED", "Decompiler plugin not available")
+    _require_decompiler()
     import ida_hexrays, idc, ida_funcs, idautils
     ea = _resolve_addr(params.get("addr"))
     func = ida_funcs.get_func(ea)
@@ -437,8 +482,7 @@ def _handle_decompile_with_xrefs(params):
 
 
 def _handle_decompile_batch(params):
-    if not _decompiler_available:
-        raise RpcError("DECOMPILER_NOT_LOADED", "Decompiler plugin not available")
+    _require_decompiler()
     import ida_hexrays, idc, ida_funcs
     addrs = params.get("addrs", [])
     if len(addrs) > MAX_BATCH_DECOMPILE:
@@ -482,7 +526,7 @@ def _handle_decompile_batch(params):
 def _handle_disasm(params):
     import idc, ida_bytes
     ea = _resolve_addr(params.get("addr"))
-    count = min(int(params.get("count", DEFAULT_DISASM_COUNT)), MAX_DISASM_LINES)
+    count = _clamp_int(params, "count", DEFAULT_DISASM_COUNT, MAX_DISASM_LINES)
     lines = []
     cur = ea
     for _ in range(count):
@@ -491,7 +535,7 @@ def _handle_disasm(params):
             break
         size = idc.get_item_size(cur) or 1  # prevent size 0
         raw = ida_bytes.get_bytes(cur, size)
-        hex_str = " ".join(f"{b:02X}" for b in raw) if raw else ""
+        hex_str = _bytes_to_hex(raw)
         lines.append({"addr": _fmt_addr(cur), "bytes": hex_str, "insn": insn})
         cur += size
     text = "\n".join(f"{ln['addr']}  {ln['bytes']:<24}  {ln['insn']}" for ln in lines)
@@ -528,11 +572,9 @@ def _handle_get_xrefs_from(params):
 
 def _handle_find_func(params):
     import idautils, idc
-    name = params.get("name")
-    if not name:
-        raise RpcError("INVALID_PARAMS", "name parameter required")
+    name = _require_param(params, "name")
     use_regex = params.get("regex", False)
-    max_results = min(int(params.get("max_results", DEFAULT_SEARCH_MAX)), MAX_SEARCH_RESULTS)
+    max_results = _clamp_int(params, "max_results", DEFAULT_SEARCH_MAX, MAX_SEARCH_RESULTS)
     try:
         pattern = re.compile(name) if use_regex else None
     except re.error as e:
@@ -602,13 +644,9 @@ def _extract_type_info(func_start_ea):
     return result
 
 
-def _handle_summary(params):
-    """Return a comprehensive binary overview in one call."""
-    import idc, idautils, ida_funcs, ida_nalt, ida_segment, ida_kernwin, ida_loader
-    # Basic info
-    func_count = sum(1 for _ in idautils.Functions())
-    idb = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
-    # Segments
+def _get_segments_info():
+    """Collect segment information."""
+    import idautils, ida_segment
     segments = []
     for ea in idautils.Segments():
         seg = ida_segment.getseg(ea)
@@ -620,7 +658,12 @@ def _handle_summary(params):
                 "size": seg.size(),
                 "perm": _perm_str(seg.perm),
             })
-    # Top imports (grouped by module)
+    return segments
+
+
+def _get_imports_summary():
+    """Get import module counts."""
+    import ida_nalt
     import_modules = {}
     for i in range(ida_nalt.get_import_module_qty()):
         mod = ida_nalt.get_import_module_name(i) or ""
@@ -631,10 +674,14 @@ def _handle_summary(params):
         ida_nalt.enum_import_names(i, cb)
         import_modules[mod] = count[0]
     top_imports = sorted(import_modules.items(), key=lambda x: -x[1])[:10]
-    total_imports = sum(import_modules.values())
-    # Top strings
-    top_count = int(params.get("string_count", 20))
-    strings_sample = []
+    total = sum(import_modules.values())
+    return top_imports, total
+
+
+def _get_strings_sample(top_count):
+    """Get a sample of strings and total count."""
+    import idc, idautils
+    sample = []
     for i, s in enumerate(idautils.Strings()):
         if i >= top_count:
             break
@@ -644,28 +691,40 @@ def _handle_summary(params):
                 decoded = val.decode("utf-8", errors="replace")
             except Exception:
                 decoded = val.hex()
-            strings_sample.append({"addr": _fmt_addr(s.ea), "value": decoded[:100]})
-    total_strings = sum(1 for _ in idautils.Strings())
-    # Function size distribution
+            sample.append({"addr": _fmt_addr(s.ea), "value": decoded[:100]})
+    total = sum(1 for _ in idautils.Strings())
+    return sample, total
+
+
+def _get_function_stats():
+    """Get function size distribution and largest functions."""
+    import idc, idautils, ida_funcs
     sizes = []
     for ea in idautils.Functions():
         func = ida_funcs.get_func(ea)
         if func:
-            sizes.append(func.size())
-    sizes.sort(reverse=True)
-    largest_funcs = []
-    for ea in idautils.Functions():
-        func = ida_funcs.get_func(ea)
-        if func and func.size() >= (sizes[9] if len(sizes) >= 10 else 0):
-            largest_funcs.append({
-                "addr": _fmt_addr(func.start_ea),
-                "name": idc.get_func_name(func.start_ea) or "",
-                "size": func.size(),
-            })
-            if len(largest_funcs) >= 10:
-                break
-    largest_funcs.sort(key=lambda x: -x["size"])
-    # Exports count
+            sizes.append((func.start_ea, func.size()))
+    sizes.sort(key=lambda x: -x[1])
+    largest = []
+    for ea, size in sizes[:10]:
+        largest.append({
+            "addr": _fmt_addr(ea),
+            "name": idc.get_func_name(ea) or "",
+            "size": size,
+        })
+    all_sizes = [s for _, s in sizes]
+    avg = round(sum(all_sizes) / len(all_sizes)) if all_sizes else 0
+    return len(sizes), largest, avg
+
+
+def _handle_summary(params):
+    """Return a comprehensive binary overview in one call."""
+    import idautils, ida_kernwin
+    func_count, largest_funcs, avg_func_size = _get_function_stats()
+    segments = _get_segments_info()
+    top_imports, total_imports = _get_imports_summary()
+    top_count = int(params.get("string_count", 20))
+    strings_sample, total_strings = _get_strings_sample(top_count)
     export_count = sum(1 for _ in idautils.Entries())
     return {
         "binary": os.path.basename(_binary_path),
@@ -679,7 +738,7 @@ def _handle_summary(params):
         "top_import_modules": [{"module": m, "count": c} for m, c in top_imports],
         "strings_sample": strings_sample,
         "largest_functions": largest_funcs,
-        "avg_func_size": round(sum(sizes) / len(sizes)) if sizes else 0,
+        "avg_func_size": avg_func_size,
     }
 
 
@@ -721,17 +780,15 @@ def _handle_get_bytes(params):
         raise RpcError("READ_FAILED", f"Cannot read {size} bytes at {_fmt_addr(ea)}")
     return {
         "addr": _fmt_addr(ea), "size": len(raw),
-        "hex": " ".join(f"{b:02X}" for b in raw),
+        "hex": _bytes_to_hex(raw),
         "raw_b64": base64.b64encode(raw).decode("ascii"),
     }
 
 
 def _handle_find_bytes(params):
     import ida_bytes, idautils, idaapi
-    pattern = params.get("pattern")
-    if not pattern:
-        raise RpcError("INVALID_PARAMS", "pattern parameter required")
-    max_results = min(int(params.get("max_results", DEFAULT_FIND_MAX)), MAX_FIND_RESULTS)
+    pattern = _require_param(params, "pattern")
+    max_results = _clamp_int(params, "max_results", DEFAULT_FIND_MAX, MAX_FIND_RESULTS)
     start_str = params.get("start")
     if start_str:
         ea = _resolve_addr(start_str)
@@ -755,14 +812,11 @@ def _handle_find_bytes(params):
 def _handle_set_name(params):
     import idc
     ea = _resolve_addr(params.get("addr"))
-    name = params.get("name")
-    if not name:
-        raise RpcError("INVALID_PARAMS", "name parameter required")
+    name = _require_param(params, "name")
     ok = idc.set_name(ea, name, idc.SN_NOWARN | idc.SN_NOCHECK)
     if not ok:
         raise RpcError("SET_NAME_FAILED", f"Cannot set name at {_fmt_addr(ea)}")
-    if _config["analysis"]["auto_save"]:
-        save_db()
+    _maybe_save_db()
     return {"ok": True, "addr": _fmt_addr(ea), "name": name}
 
 
@@ -778,8 +832,7 @@ def _handle_set_comment(params):
         ok = idc.set_cmt(ea, comment, repeatable)
     if ok == 0 and comment:  # IDA returns 0 on failure
         raise RpcError("SET_COMMENT_FAILED", f"Cannot set comment at {_fmt_addr(ea)}")
-    if _config["analysis"]["auto_save"]:
-        save_db()
+    _maybe_save_db()
     return {"ok": True, "addr": _fmt_addr(ea)}
 
 
@@ -795,25 +848,10 @@ def _handle_get_comments(params):
 
 
 def _handle_set_type(params):
-    import idc, ida_typeinf
     ea = _resolve_addr(params.get("addr"))
-    type_str = params.get("type")
-    if not type_str:
-        raise RpcError("INVALID_PARAMS", "type parameter required")
-    # Ensure declaration ends with semicolon for parse_decl
-    decl = type_str.rstrip(";") + ";"
-    tif = ida_typeinf.tinfo_t()
-    til = ida_typeinf.get_idati()
-    result = ida_typeinf.parse_decl(tif, til, decl, ida_typeinf.PT_SIL)
-    if result is None:
-        raise RpcError("PARSE_TYPE_FAILED",
-                        f"Cannot parse type declaration: {type_str}",
-                        suggestion="Use C syntax, e.g. 'int __fastcall foo(int a, char *b);'")
-    ok = ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE)
-    if not ok:
-        raise RpcError("SET_TYPE_FAILED", f"Cannot apply type at {_fmt_addr(ea)}")
-    if _config["analysis"]["auto_save"]:
-        save_db()
+    type_str = _require_param(params, "type")
+    tif = _parse_and_apply_type(ea, type_str)
+    _maybe_save_db()
     return {"ok": True, "addr": _fmt_addr(ea), "type": str(tif)}
 
 
@@ -925,15 +963,12 @@ def _import_types(data, stats):
 
 def _handle_import_annotations(params):
     """Import annotations from JSON."""
-    data = params.get("data")
-    if not data:
-        raise RpcError("INVALID_PARAMS", "data parameter required (JSON annotations)")
+    data = _require_param(params, "data", "data parameter required (JSON annotations)")
     stats = {"names": 0, "comments": 0, "types": 0, "errors": 0}
     _import_names(data, stats)
     _import_comments(data, stats)
     _import_types(data, stats)
-    if _config["analysis"]["auto_save"]:
-        save_db()
+    _maybe_save_db()
     return stats
 
 
@@ -941,11 +976,36 @@ def _handle_import_annotations(params):
 # Call graph
 # ─────────────────────────────────────────────
 
+def _generate_dot_graph(nodes, edges, root_addr):
+    """Generate DOT format graph."""
+    lines = ["digraph callgraph {", '  rankdir=LR;',
+             '  node [shape=box, style=filled, fillcolor="#f0f0f0"];']
+    for addr, name in nodes.items():
+        color = '#ffcccc' if addr == root_addr else '#f0f0f0'
+        label = name.replace('"', '\\"')
+        lines.append(f'  "{addr}" [label="{label}", fillcolor="{color}"];')
+    for src, dst in edges:
+        lines.append(f'  "{src}" -> "{dst}";')
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _generate_mermaid_graph(nodes, edges):
+    """Generate Mermaid format graph."""
+    lines = ["graph LR"]
+    for addr, name in nodes.items():
+        safe = name.replace('"', "'")
+        lines.append(f'  {addr.replace("0x", "x")}["{safe}"]')
+    for src, dst in edges:
+        lines.append(f'  {src.replace("0x", "x")} --> {dst.replace("0x", "x")}')
+    return "\n".join(lines)
+
+
 def _handle_callgraph(params):
     """Build call graph starting from a function."""
     import idc, ida_funcs, idautils
     ea = _resolve_addr(params.get("addr"))
-    depth = min(int(params.get("depth", 3)), 10)
+    depth = _clamp_int(params, "depth", 3, 10)
     direction = params.get("direction", "callees")  # callees, callers, both
 
     nodes = {}  # addr -> name
@@ -993,27 +1053,9 @@ def _handle_callgraph(params):
         # Reset nodes tracking for callers if both
         collect_callers(ea, 0)
 
-    # Generate DOT
-    dot_lines = ["digraph callgraph {", '  rankdir=LR;', '  node [shape=box, style=filled, fillcolor="#f0f0f0"];']
     root_addr = _fmt_addr(ea)
-    for addr, name in nodes.items():
-        color = '#ffcccc' if addr == root_addr else '#f0f0f0'
-        label = name.replace('"', '\\"')
-        dot_lines.append(f'  "{addr}" [label="{label}", fillcolor="{color}"];')
-    for src, dst in edges:
-        dot_lines.append(f'  "{src}" -> "{dst}";')
-    dot_lines.append("}")
-    dot = "\n".join(dot_lines)
-
-    # Generate Mermaid
-    mermaid_lines = ["graph LR"]
-    for addr, name in nodes.items():
-        safe = name.replace('"', "'")
-        mermaid_lines.append(f'  {addr.replace("0x", "x")}["{safe}"]')
-    for src, dst in edges:
-        mermaid_lines.append(f'  {src.replace("0x", "x")} --> {dst.replace("0x", "x")}')
-    mermaid = "\n".join(mermaid_lines)
-
+    dot = _generate_dot_graph(nodes, edges, root_addr)
+    mermaid = _generate_mermaid_graph(nodes, edges)
     saved_to = _save_output(params.get("output"), dot)
     return {
         "root": root_addr,
@@ -1038,25 +1080,22 @@ def _handle_patch_bytes(params):
                         "Patching requires security.exec_enabled=true",
                         suggestion="Set security.exec_enabled to true in config.json")
     ea = _resolve_addr(params.get("addr"))
-    hex_str = params.get("bytes")
-    if not hex_str:
-        raise RpcError("INVALID_PARAMS", "bytes parameter required (hex string)")
+    hex_str = _require_param(params, "bytes", "bytes parameter required (hex string)")
     try:
         raw = bytes.fromhex(hex_str.replace(" ", ""))
     except ValueError:
         raise RpcError("INVALID_PARAMS", "Invalid hex string")
     # Read original bytes for undo info
     original = ida_bytes.get_bytes(ea, len(raw))
-    orig_hex = " ".join(f"{b:02X}" for b in original) if original else ""
+    orig_hex = _bytes_to_hex(original)
     for i, byte_val in enumerate(raw):
         ida_bytes.patch_byte(ea + i, byte_val)
-    if _config["analysis"]["auto_save"]:
-        save_db()
+    _maybe_save_db()
     return {
         "addr": _fmt_addr(ea),
         "size": len(raw),
         "original": orig_hex,
-        "patched": " ".join(f"{b:02X}" for b in raw),
+        "patched": _bytes_to_hex(raw),
     }
 
 
@@ -1071,7 +1110,7 @@ def _handle_search_const(params):
     if value is None:
         raise RpcError("INVALID_PARAMS", "value parameter required")
     target = int(str(value), 0)  # supports hex, decimal, octal
-    max_results = min(int(params.get("max_results", DEFAULT_SEARCH_MAX)), MAX_SEARCH_RESULTS)
+    max_results = _clamp_int(params, "max_results", DEFAULT_SEARCH_MAX, MAX_SEARCH_RESULTS)
     results = []
     for seg_ea in idautils.Segments():
         ea = idc.get_segm_start(seg_ea)
@@ -1131,9 +1170,7 @@ def _handle_list_structs(params):
 def _handle_get_struct(params):
     """Get struct details with members."""
     import ida_typeinf
-    name = params.get("name")
-    if not name:
-        raise RpcError("INVALID_PARAMS", "name parameter required")
+    name = _require_param(params, "name")
     tif = ida_typeinf.tinfo_t()
     if not tif.get_named_type(ida_typeinf.get_idati(), name):
         raise RpcError("STRUCT_NOT_FOUND", f"Struct not found: {name}")
@@ -1161,9 +1198,7 @@ def _handle_get_struct(params):
 def _handle_create_struct(params):
     """Create a new struct via type declaration."""
     import ida_typeinf
-    name = params.get("name")
-    if not name:
-        raise RpcError("INVALID_PARAMS", "name parameter required")
+    name = _require_param(params, "name")
     is_union = params.get("is_union", False)
     members = params.get("members", [])
     keyword = "union" if is_union else "struct"
@@ -1189,8 +1224,7 @@ def _handle_create_struct(params):
     result = ida_typeinf.idc_parse_types(decl, 0)
     if result != 0:
         raise RpcError("CREATE_STRUCT_FAILED", f"Cannot create struct: {decl}")
-    if _config["analysis"]["auto_save"]:
-        save_db()
+    _maybe_save_db()
     return {"ok": True, "name": name, "members_added": len(members)}
 
 
@@ -1241,9 +1275,7 @@ def _handle_snapshot_list(params):
 def _handle_snapshot_restore(params):
     """Restore IDB from a snapshot file."""
     import ida_loader, shutil
-    filename = params.get("filename")
-    if not filename:
-        raise RpcError("INVALID_PARAMS", "filename parameter required")
+    filename = _require_param(params, "filename")
     if not os.path.isfile(filename):
         raise RpcError("FILE_NOT_FOUND", f"Snapshot file not found: {filename}")
     idb_path = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
@@ -1292,9 +1324,7 @@ def _handle_list_enums(params):
 def _handle_get_enum(params):
     """Get enum details with members."""
     import ida_typeinf
-    name = params.get("name")
-    if not name:
-        raise RpcError("INVALID_PARAMS", "name parameter required")
+    name = _require_param(params, "name")
     tif = ida_typeinf.tinfo_t()
     if not tif.get_named_type(ida_typeinf.get_idati(), name):
         raise RpcError("ENUM_NOT_FOUND", f"Enum not found: {name}")
@@ -1312,9 +1342,7 @@ def _handle_get_enum(params):
 def _handle_create_enum(params):
     """Create a new enum via type declaration."""
     import ida_typeinf
-    name = params.get("name")
-    if not name:
-        raise RpcError("INVALID_PARAMS", "name parameter required")
+    name = _require_param(params, "name")
     members = params.get("members", [])
     if members:
         fields = []
@@ -1332,8 +1360,7 @@ def _handle_create_enum(params):
     result = ida_typeinf.idc_parse_types(decl, 0)
     if result != 0:
         raise RpcError("CREATE_ENUM_FAILED", f"Cannot create enum: {decl}")
-    if _config["analysis"]["auto_save"]:
-        save_db()
+    _maybe_save_db()
     return {"ok": True, "name": name, "members_added": len(members)}
 
 
@@ -1343,15 +1370,12 @@ def _handle_create_enum(params):
 
 def _handle_search_code(params):
     """Search for a string within decompiled pseudocode."""
-    if not _decompiler_available:
-        raise RpcError("DECOMPILER_NOT_LOADED", "Decompiler plugin not available")
+    _require_decompiler()
     import ida_hexrays, idc, idautils, ida_funcs
-    query = params.get("query")
-    if not query:
-        raise RpcError("INVALID_PARAMS", "query parameter required")
+    query = _require_param(params, "query")
     case_sensitive = params.get("case_sensitive", False)
-    max_results = min(int(params.get("max_results", 20)), 100)
-    max_funcs = min(int(params.get("max_funcs", 500)), 2000)
+    max_results = _clamp_int(params, "max_results", 20, 100)
+    max_funcs = _clamp_int(params, "max_funcs", 500, 2000)
 
     if not case_sensitive:
         query_lower = query.lower()
@@ -1408,8 +1432,7 @@ def _handle_search_code(params):
 
 def _handle_decompile_diff(params):
     """Decompile a function and return code for diffing."""
-    if not _decompiler_available:
-        raise RpcError("DECOMPILER_NOT_LOADED", "Decompiler not available")
+    _require_decompiler()
     import ida_hexrays, idc, ida_funcs
     ea = _resolve_addr(params.get("addr"))
     func = ida_funcs.get_func(ea)
@@ -1475,7 +1498,7 @@ def _suggest_name_by_api(ea):
 def _handle_auto_rename(params):
     """Heuristic-based automatic function renaming."""
     import idc, idautils, ida_funcs
-    max_funcs = min(int(params.get("max_funcs", 200)), 1000)
+    max_funcs = _clamp_int(params, "max_funcs", 200, 1000)
     dry_run = params.get("dry_run", True)
 
     renames = []
@@ -1504,8 +1527,8 @@ def _handle_auto_rename(params):
             if not dry_run:
                 idc.set_name(ea, suggested, idc.SN_NOWARN | idc.SN_NOCHECK)
 
-    if not dry_run and renames and _config["analysis"]["auto_save"]:
-        save_db()
+    if not dry_run and renames:
+        _maybe_save_db()
     return {"total": len(renames), "dry_run": dry_run, "renames": renames}
 
 
@@ -1582,7 +1605,7 @@ def _handle_export_script(params):
 def _handle_detect_vtables(params):
     """Detect virtual function tables in data segments."""
     import idc, idautils, ida_funcs, ida_bytes, ida_segment
-    max_results = min(int(params.get("max_results", 50)), 200)
+    max_results = _clamp_int(params, "max_results", 50, 200)
     min_entries = int(params.get("min_entries", 3))
     ptr_size = 8 if idc.get_inf_attr(idc.INF_LFLAGS) & 1 else 4  # 64-bit check
 
@@ -1640,9 +1663,7 @@ def _handle_detect_vtables(params):
 def _handle_apply_sig(params):
     """Apply FLIRT signature file."""
     import ida_funcs, idc, idautils
-    sig_name = params.get("name")
-    if not sig_name:
-        raise RpcError("INVALID_PARAMS", "name parameter required (signature name without .sig)")
+    sig_name = _require_param(params, "name", "name parameter required (signature name without .sig)")
     try:
         import ida_sigmake
     except ImportError:
@@ -1691,9 +1712,7 @@ def _handle_exec(params):
         raise RpcError("EXEC_DISABLED",
                         "exec is disabled in config (security.exec_enabled=false)",
                         suggestion="Set security.exec_enabled to true in config.json")
-    code = params.get("code")
-    if not code:
-        raise RpcError("INVALID_PARAMS", "code parameter required")
+    code = _require_param(params, "code")
     stdout_buf = io.StringIO()
     stderr_buf = io.StringIO()
     try:
