@@ -1716,7 +1716,18 @@ def _handle_decompile_all(params):
             match = re.match(r'// ── (\S+)', entry)
             fname = match.group(1) if match else f"func_{results.index(entry)}"
             safe_name = re.sub(r'[^\w\-.]', '_', fname)
+            # Truncate to avoid Windows MAX_PATH (260) issues
+            max_name = 200 - len(output_path)
+            if max_name < 40:
+                max_name = 40
+            if len(safe_name) > max_name:
+                safe_name = safe_name[:max_name]
             fpath = os.path.join(output_path, f"{safe_name}.c")
+            # Handle collisions from truncation
+            counter = 1
+            while os.path.exists(fpath):
+                fpath = os.path.join(output_path, f"{safe_name}_{counter}.c")
+                counter += 1
             with open(fpath, "w", encoding="utf-8") as f:
                 f.write(entry)
     else:
