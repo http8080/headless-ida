@@ -32,6 +32,7 @@ except ImportError:
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPT_DIR)
 from arch_detect import arch_detect
+from contextlib import contextmanager
 from common import (
     load_config as _load_config_core,
     init_registry_paths, acquire_lock, release_lock,
@@ -42,8 +43,52 @@ from common import (
 _DEFAULT_CONFIG = os.path.join(_SCRIPT_DIR, "config.json")
 
 # ─────────────────────────────────────────────
+# CLI Output Helpers
+# ─────────────────────────────────────────────
+
+def _log_ok(msg):    print(f"[+] {msg}")
+def _log_err(msg):   print(f"[-] {msg}")
+def _log_info(msg):  print(f"[*] {msg}")
+def _log_warn(msg):  print(f"[!] {msg}")
+
+
+def _error_resp(code, message, suggestion=None):
+    """Build a standard error response dict."""
+    err = {"code": code, "message": message}
+    if suggestion:
+        err["suggestion"] = suggestion
+    return {"error": err}
+
+
+def _opt(args, name, default=None):
+    """Safe getattr with default — replaces repetitive getattr(args, name, None) calls."""
+    return getattr(args, name, default)
+
+
+@contextmanager
+def _registry_locked():
+    """Context manager for registry lock acquisition."""
+    if not acquire_lock():
+        raise RuntimeError("Could not acquire registry lock")
+    try:
+        yield
+    finally:
+        release_lock()
+
+
+# ─────────────────────────────────────────────
 # Constants (CLI-specific)
 # ─────────────────────────────────────────────
+
+SUPPORTED_BINARY_EXTENSIONS = {
+    ".exe", ".dll", ".sys", ".so", ".dylib", ".o", ".obj",
+    ".elf", ".bin", ".ko", ".axf", ".hex", ".srec", ".efi",
+}
+
+AUTO_GENERATED_PREFIXES = (
+    "sub_", "nullsub_", "loc_", "unk_", "byte_", "word_",
+    "dword_", "qword_", "off_", "stru_", "asc_",
+)
 
 INSTANCE_ID_LENGTH = 4              # base36 chars for instance ID
 INSTANCE_ID_CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
@@ -191,8 +236,7 @@ _BATCH_METHODS = {"decompile_batch", "exec"}
 
 def post_rpc(config, port, method, instance_id, params=None, timeout=None):
     if req_lib is None:
-        return {"error": {"code": "MISSING_DEP",
-                          "message": "requests package not installed (pip install requests)"}}
+        return _error_resp("MISSING_DEP", "requests package not installed (pip install requests)")
     if timeout is None:
         timeout = config["analysis"]["request_timeout_batch"] if method in _BATCH_METHODS \
             else config["analysis"]["request_timeout"]
@@ -210,18 +254,15 @@ def post_rpc(config, port, method, instance_id, params=None, timeout=None):
             try:
                 return resp.json()
             except ValueError:
-                return {"error": {"code": "INVALID_RESPONSE",
-                         "message": f"HTTP {resp.status_code}: {resp.text[:200]}"}}
+                return _error_resp("INVALID_RESPONSE", f"HTTP {resp.status_code}: {resp.text[:200]}")
         except req_lib.ConnectionError:
             if attempt < RPC_MAX_RETRIES - 1:
                 time.sleep(RPC_RETRY_DELAY)
                 continue
-            return {"error": {"code": "CONNECTION_FAILED",
-                     "message": f"Cannot connect to 127.0.0.1:{port}"}}
+            return _error_resp("CONNECTION_FAILED", f"Cannot connect to 127.0.0.1:{port}")
         except req_lib.Timeout:
-            return {"error": {"code": "TIMEOUT",
-                     "message": f"Request timeout ({timeout}s)"}}
-    return {"error": {"code": "UNKNOWN", "message": "Unexpected error"}}
+            return _error_resp("TIMEOUT", f"Request timeout ({timeout}s)")
+    return _error_resp("UNKNOWN", "Unexpected error")
 
 
 # ─────────────────────────────────────────────
@@ -230,22 +271,22 @@ def post_rpc(config, port, method, instance_id, params=None, timeout=None):
 
 def resolve_instance(args, config):
     registry = load_registry()
-    iid = getattr(args, 'instance', None)
+    iid = _opt(args, 'instance')
     if iid:
         if iid in registry:
             return iid, registry[iid]
-        print(f"[-] Instance '{iid}' not found")
+        _log_err(f"Instance '{iid}' not found")
         return None, None
-    hint = getattr(args, 'binary_hint', None)
+    hint = _opt(args, 'binary_hint')
     if hint:
         matches = [(k, v) for k, v in registry.items()
                    if hint.lower() in v.get("binary", "").lower()]
         if len(matches) == 1:
             return matches[0]
         if not matches:
-            print(f"[-] No instance matching '{hint}'")
+            _log_err(f"No instance matching '{hint}'")
         else:
-            print(f"[-] Multiple instances match '{hint}':")
+            _log_err(f"Multiple instances match '{hint}':")
             for k, v in matches:
                 print(f"  {k}  {v.get('binary', '?')}")
         return None, None
@@ -255,9 +296,9 @@ def resolve_instance(args, config):
         k = next(iter(active))
         return k, active[k]
     if not active:
-        print("[-] No active instances. Use 'start' first.")
+        _log_err("No active instances. Use 'start' first.")
     else:
-        print("[-] Multiple active instances. Use -i <id> to select:")
+        _log_err("Multiple active instances. Use -i <id> to select:")
         for k, v in active.items():
             print(f"  {k}  {v.get('state', '?'):<12}  {v.get('binary', '?')}")
     return None, None
@@ -267,45 +308,53 @@ def resolve_instance(args, config):
 # RPC Proxy Helper
 # ─────────────────────────────────────────────
 
+def _ensure_ready(iid, info):
+    """Check instance is ready. Returns (port, ok)."""
+    if info.get("state") != "ready":
+        _log_err(f"Instance {iid} is not ready (state: {info.get('state')})")
+        return None, False
+    port = info.get("port")
+    if not port:
+        _log_err(f"Instance {iid} has no port assigned")
+        return None, False
+    return port, True
+
+
 def _rpc_call(args, config, method, params=None):
     iid, info = resolve_instance(args, config)
     if not iid:
         return None
-    if info.get("state") != "ready":
-        print(f"[-] Instance {iid} is not ready (state: {info.get('state')})")
-        return None
-    port = info.get("port")
-    if not port:
-        print(f"[-] Instance {iid} has no port assigned")
+    port, ok = _ensure_ready(iid, info)
+    if not ok:
         return None
     resp = post_rpc(config, port, method, iid, params=params)
     if "error" in resp:
         err = resp["error"]
         # Health check: if connection failed, check if process is alive
         if err.get("code") == "CONNECTION_FAILED" and not _is_process_alive(info):
-            print(f"[-] Instance {iid} server process is dead (pid={info.get('pid')})")
+            _log_err(f"Instance {iid} server process is dead (pid={info.get('pid')})")
             binary = info.get("path")
             if binary and os.path.isfile(binary):
-                print(f"[*] Cleaning up stale instance...")
-                if acquire_lock():
-                    try:
+                _log_info("Cleaning up stale instance...")
+                try:
+                    with _registry_locked():
                         r = load_registry()
                         r.pop(iid, None)
                         save_registry(r)
-                    finally:
-                        release_lock()
+                except RuntimeError:
+                    pass
                 remove_auth_token(config["security"]["auth_token_file"], iid)
-                print(f"[*] Restart with: ida-cli start {binary}")
+                _log_info(f"Restart with: ida-cli start {binary}")
             return None
-        if getattr(args, 'json_output', False):
+        if _opt(args, 'json_output', False):
             print(json.dumps(resp, ensure_ascii=False, indent=2))
         else:
-            print(f"[-] {err.get('code')}: {err.get('message')}")
+            _log_err(f"{err.get('code')}: {err.get('message')}")
             if err.get("suggestion"):
                 print(f"    Hint: {err['suggestion']}")
         return None
     result = resp.get("result", {})
-    if getattr(args, 'json_output', False):
+    if _opt(args, 'json_output', False):
         print(json.dumps(resp, ensure_ascii=False, indent=2))
         return None
     return result
@@ -320,8 +369,8 @@ def cmd_init(config):
             os.path.dirname(config["paths"]["registry"])]
     for d in dirs:
         os.makedirs(d, exist_ok=True)
-        print(f"  [+] {d}")
-    print("[+] Init complete")
+        _log_ok(d)
+    _log_ok("Init complete")
 
 
 def cmd_check(config):
@@ -359,37 +408,36 @@ def cmd_check(config):
 def _register_instance(config, instance_id, binary_path, arch_info,
                         idb_path, log_path, force):
     """Register an instance in the registry. Returns True on success."""
-    if not acquire_lock():
-        print("[-] Could not acquire registry lock")
-        return False
     try:
-        registry = load_registry()
-        cleanup_stale(registry, config["analysis"]["stale_threshold"])
-        if len(registry) >= config["analysis"]["max_instances"]:
-            print(f"[-] Max instances reached ({config['analysis']['max_instances']})")
-            return False
-        for info in registry.values():
-            if (os.path.normcase(info.get("path", "")) == binary_path
-                    and info.get("state") in ("analyzing", "ready")):
-                if not force:
-                    print(f"[!] {os.path.basename(binary_path)} already running "
-                          f"(id: {info['id']}). Use --force.")
-                    return False
-        registry[instance_id] = {
-            "id": instance_id, "pid": None, "port": None,
-            "binary": os.path.basename(binary_path),
-            "path": binary_path,
-            "arch": arch_info.get("arch"), "bits": arch_info.get("bits"),
-            "format": arch_info.get("file_format"),
-            "idb_path": idb_path, "log_path": log_path,
-            "state": "initializing",
-            "started": time.time(),
-            "last_heartbeat": None,
-        }
-        save_registry(registry)
-        return True
-    finally:
-        release_lock()
+        with _registry_locked():
+            registry = load_registry()
+            cleanup_stale(registry, config["analysis"]["stale_threshold"])
+            if len(registry) >= config["analysis"]["max_instances"]:
+                _log_err(f"Max instances reached ({config['analysis']['max_instances']})")
+                return False
+            for info in registry.values():
+                if (os.path.normcase(info.get("path", "")) == binary_path
+                        and info.get("state") in ("analyzing", "ready")):
+                    if not force:
+                        _log_warn(f"{os.path.basename(binary_path)} already running "
+                                  f"(id: {info['id']}). Use --force.")
+                        return False
+            registry[instance_id] = {
+                "id": instance_id, "pid": None, "port": None,
+                "binary": os.path.basename(binary_path),
+                "path": binary_path,
+                "arch": arch_info.get("arch"), "bits": arch_info.get("bits"),
+                "format": arch_info.get("file_format"),
+                "idb_path": idb_path, "log_path": log_path,
+                "state": "initializing",
+                "started": time.time(),
+                "last_heartbeat": None,
+            }
+            save_registry(registry)
+            return True
+    except RuntimeError:
+        _log_err("Could not acquire registry lock")
+        return False
 
 
 def _spawn_server(config, config_path, binary_path, instance_id, idb_path, log_path, fresh):
@@ -438,16 +486,14 @@ def _wait_for_start(instance_id):
 def cmd_start(args, config, config_path):
     binary_path = os.path.normcase(os.path.abspath(args.binary))
     if not os.path.isfile(binary_path):
-        print(f"[-] Binary not found: {binary_path}")
+        _log_err(f"Binary not found: {binary_path}")
         return
 
-    arch_info = arch_detect(binary_path, getattr(args, 'arch', None))
+    arch_info = arch_detect(binary_path, _opt(args, 'arch'))
     instance_id = make_instance_id(binary_path)
-    force = getattr(args, 'force', False)
-    fresh = getattr(args, 'fresh', False)
-    idb_dir_override = getattr(args, 'idb_dir', None)
-    if not idb_dir_override:
-        idb_dir_override = os.environ.get('IDA_IDB_DIR')
+    force = _opt(args, 'force', False)
+    fresh = _opt(args, 'fresh', False)
+    idb_dir_override = _opt(args, 'idb_dir') or os.environ.get('IDA_IDB_DIR')
     idb_path = get_idb_path(config, binary_path, instance_id, force, idb_dir=idb_dir_override)
 
     if os.path.exists(idb_path) and not fresh:
@@ -456,7 +502,7 @@ def cmd_start(args, config, config_path):
         if stored_md5:
             current_md5 = file_md5(binary_path)
             if stored_md5 != current_md5:
-                print("[!] Binary changed since .i64 was created.")
+                _log_warn("Binary changed since .i64 was created.")
                 if not force:
                     print("  Use --fresh to rebuild, or --force to proceed.")
                     return
@@ -472,16 +518,16 @@ def cmd_start(args, config, config_path):
     fmt = arch_info.get("file_format", "?")
     arch = arch_info.get("arch", "?")
     bits = arch_info.get("bits", "?")
-    print(f"[+] Instance started: {instance_id}")
+    _log_ok(f"Instance started: {instance_id}")
     print(f"    Binary:  {os.path.basename(binary_path)} ({fmt} {arch} {bits}bit)")
     print(f"    IDB:     {idb_path}")
     print(f"    Log:     {log_path}")
     print(f"    State:   {state}")
     print(f"    PID:     {proc.pid}")
     if state == "error":
-        print(f"[-] Analysis failed. Check: ida_cli.py logs {instance_id}")
+        _log_err(f"Analysis failed. Check: ida_cli.py logs {instance_id}")
     elif state in ("initializing", "analyzing"):
-        print(f"[*] Still {state}. Use: ida_cli.py wait {instance_id}")
+        _log_info(f"Still {state}. Use: ida_cli.py wait {instance_id}")
 
 
 def cmd_stop(args, config):
@@ -489,7 +535,7 @@ def cmd_stop(args, config):
     registry = load_registry()
     info = registry.get(iid)
     if not info:
-        print(f"[-] Instance '{iid}' not found")
+        _log_err(f"Instance '{iid}' not found")
         return
     port = info.get("port")
     pid = info.get("pid")
@@ -500,7 +546,7 @@ def cmd_stop(args, config):
             for _ in range(STOP_WAIT_ITERATIONS):
                 time.sleep(STOP_POLL_INTERVAL)
                 if iid not in load_registry():
-                    print(f"[+] Instance {iid} stopped normally")
+                    _log_ok(f"Instance {iid} stopped normally")
                     return
         except Exception:
             pass  # RPC stop failed, fall through to force kill
@@ -508,13 +554,13 @@ def cmd_stop(args, config):
     if pid:
         _force_kill(iid, pid, info.get("pid_create_time"))
 
-    if acquire_lock():
-        try:
+    try:
+        with _registry_locked():
             r = load_registry()
             r.pop(iid, None)
             save_registry(r)
-        finally:
-            release_lock()
+    except RuntimeError:
+        pass
     remove_auth_token(config["security"]["auth_token_file"], iid)
 
 
@@ -523,63 +569,62 @@ def _force_kill(iid, pid, stored_create_time):
     if psutil is None:
         try:
             os.kill(pid, 9)
-            print(f"[+] Instance {iid} force killed (pid={pid})")
+            _log_ok(f"Instance {iid} force killed (pid={pid})")
         except OSError:
-            print(f"[+] Instance {iid} process already gone")
+            _log_ok(f"Instance {iid} process already gone")
         return
     try:
         proc = psutil.Process(pid)
         if (stored_create_time
                 and abs(proc.create_time() - stored_create_time) > PID_CREATE_TIME_TOLERANCE):
-            print(f"[+] Instance {iid} process already gone (PID reused)")
+            _log_ok(f"Instance {iid} process already gone (PID reused)")
         else:
             proc.kill()
-            print(f"[+] Instance {iid} force killed (pid={pid})")
+            _log_ok(f"Instance {iid} force killed (pid={pid})")
     except (psutil.NoSuchProcess, psutil.AccessDenied):
-        print(f"[+] Instance {iid} process already gone")
+        _log_ok(f"Instance {iid} process already gone")
 
 
 def cmd_wait(args, config):
     iid = args.id
-    timeout = getattr(args, 'timeout', 300)
+    timeout = _opt(args, 'timeout', 300)
     poll = config["analysis"]["wait_poll_interval"]
     deadline = time.time() + timeout
     state = "unknown"
     while time.time() < deadline:
         info = load_registry().get(iid)
         if not info:
-            print(f"[-] Instance {iid} not found")
+            _log_err(f"Instance {iid} not found")
             return
         state = info.get("state", "unknown")
         port = info.get("port")
         if state in ("initializing", "analyzing"):
             remaining = int(deadline - time.time())
-            print(f"[*] {state}... ({remaining}s remaining)", flush=True)
+            _log_info(f"{state}... ({remaining}s remaining)")
             time.sleep(poll)
             continue
         if state == "ready" and port:
             resp = post_rpc(config, port, "ping", iid)
             if resp.get("result", {}).get("state") == "ready":
-                print("[+] ready")
+                _log_ok("ready")
                 return
         if state == "error":
-            print(f"[-] Analysis failed. Check: ida_cli.py logs {iid}")
+            _log_err(f"Analysis failed. Check: ida_cli.py logs {iid}")
             return
         time.sleep(poll)
-    print(f"[-] Timeout ({timeout}s). Current state: {state}")
+    _log_err(f"Timeout ({timeout}s). Current state: {state}")
 
 
 def cmd_list(args, config):
-    if not acquire_lock():
-        print("[-] Could not acquire registry lock")
-        return
     try:
-        registry = load_registry()
-        cleanup_stale(registry, config["analysis"]["stale_threshold"])
-    finally:
-        release_lock()
+        with _registry_locked():
+            registry = load_registry()
+            cleanup_stale(registry, config["analysis"]["stale_threshold"])
+    except RuntimeError:
+        _log_err("Could not acquire registry lock")
+        return
     if not registry:
-        print("[*] No active instances")
+        _log_info("No active instances")
         return
     for iid, info in registry.items():
         state = info.get("state", "unknown")
@@ -589,14 +634,14 @@ def cmd_list(args, config):
 
 
 def cmd_status(args, config):
-    iid = getattr(args, 'id', None)
+    iid = _opt(args, 'id')
     if not iid:
         cmd_list(args, config)
         return
     registry = load_registry()
     info = registry.get(iid)
     if not info:
-        print(f"[-] Instance '{iid}' not found")
+        _log_err(f"Instance '{iid}' not found")
         return
     if info.get("state") == "ready" and info.get("port"):
         resp = post_rpc(config, info["port"], "status", iid)
@@ -618,13 +663,13 @@ def cmd_logs(args, config):
     iid = args.id
     info = load_registry().get(iid)
     if not info:
-        print(f"[-] Instance '{iid}' not found")
+        _log_err(f"Instance '{iid}' not found")
         return
     log_path = info.get("log_path")
     if not log_path or not os.path.exists(log_path):
-        print(f"[-] Log file not found: {log_path}")
+        _log_err(f"Log file not found: {log_path}")
         return
-    if getattr(args, 'follow', False):
+    if _opt(args, 'follow', False):
         try:
             with open(log_path, encoding='utf-8') as f:
                 f.seek(0, 2)
@@ -634,13 +679,13 @@ def cmd_logs(args, config):
                         print(line, end='', flush=True)
                     else:
                         if not os.path.exists(log_path):
-                            print("\n[*] Log file removed")
+                            _log_info("Log file removed")
                             return
                         time.sleep(STOP_POLL_INTERVAL)
         except KeyboardInterrupt:
             pass
     else:
-        tail = getattr(args, 'tail', 50)
+        tail = _opt(args, 'tail', 50)
         with open(log_path, encoding='utf-8') as f:
             lines = f.readlines()
         for line in lines[-tail:]:
@@ -648,7 +693,7 @@ def cmd_logs(args, config):
 
 
 def cmd_cleanup(args, config):
-    dry_run = getattr(args, 'dry_run', False)
+    dry_run = _opt(args, 'dry_run', False)
     registry = load_registry()
     active_ids = set(registry.keys())
     log_dir = config["paths"]["log_dir"]
@@ -663,28 +708,29 @@ def cmd_cleanup(args, config):
                 os.remove(f)
                 print(f"  Deleted: {f}")
     token_path = config["security"]["auth_token_file"]
-    if os.path.exists(token_path) and acquire_lock():
+    if os.path.exists(token_path):
         try:
-            with open(token_path, encoding="utf-8") as fp:
-                lines = fp.readlines()
-            cleaned = [l for l in lines if l.strip().split(":")[0] in active_ids]
-            removed = len(lines) - len(cleaned)
-            if removed > 0:
-                if dry_run:
-                    print(f"  [dry-run] Would remove {removed} stale auth entries")
-                else:
-                    with open(token_path, "w", encoding="utf-8") as fp:
-                        fp.writelines(cleaned)
-                    print(f"  Removed {removed} stale auth entries")
-        finally:
-            release_lock()
+            with _registry_locked():
+                with open(token_path, encoding="utf-8") as fp:
+                    lines = fp.readlines()
+                cleaned = [l for l in lines if l.strip().split(":")[0] in active_ids]
+                removed = len(lines) - len(cleaned)
+                if removed > 0:
+                    if dry_run:
+                        print(f"  [dry-run] Would remove {removed} stale auth entries")
+                    else:
+                        with open(token_path, "w", encoding="utf-8") as fp:
+                            fp.writelines(cleaned)
+                        print(f"  Removed {removed} stale auth entries")
+        except RuntimeError:
+            pass
     for f in glob.glob(os.path.join(idb_dir, "*")):
         if f.endswith(".meta.json"):
             continue
         in_use = any(info.get("idb_path") == f for info in registry.values())
         if not in_use:
             print(f"  [info] Unused: {os.path.basename(f)}")
-    print("[+] Cleanup done")
+    _log_ok("Cleanup done")
 
 
 # ─────────────────────────────────────────────
@@ -693,7 +739,7 @@ def cmd_cleanup(args, config):
 
 def _is_md_out(args):
     """Check if --out path ends with .md"""
-    out = getattr(args, 'out', None)
+    out = _opt(args, 'out')
     return out and out.lower().endswith('.md')
 
 
@@ -702,7 +748,7 @@ def _save_local(path, content):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
-    print(f"[+] Saved to: {path}")
+    _log_ok(f"Saved to: {path}")
 
 
 def _md_decompile(r, with_xrefs=False):
@@ -773,13 +819,19 @@ def _check_inline_limit(text, config):
     return truncated, True
 
 
-def _list_params(args):
+def _build_params(args, mapping):
+    """Build RPC params dict from args attributes. mapping: {attr_name: param_key}"""
     p = {}
-    if getattr(args, 'offset', None) is not None: p["offset"] = args.offset
-    if getattr(args, 'count', None) is not None: p["count"] = args.count
-    if getattr(args, 'filter', None): p["filter"] = args.filter
-    if getattr(args, 'out', None): p["output"] = args.out
+    for attr, key in mapping.items():
+        val = _opt(args, attr)
+        if val is not None:
+            p[key] = val
     return p
+
+
+def _list_params(args):
+    return _build_params(args, {"offset": "offset", "count": "count",
+                                "filter": "filter", "out": "output"})
 
 
 # ── List-type command factory ──
@@ -832,8 +884,7 @@ def _cmd_proxy_list(args, config, method, header_fn, format_fn):
 # ── Individual proxy commands ──
 
 def cmd_proxy_segments(args, config):
-    p = {}
-    if getattr(args, 'out', None): p["output"] = args.out
+    p = _build_params(args, {"out": "output"})
     r = _rpc_call(args, config, "get_segments", p)
     if not r: return
     for d in r.get("data", []):
@@ -842,10 +893,10 @@ def cmd_proxy_segments(args, config):
 
 
 def cmd_proxy_decompile(args, config):
-    with_xrefs = getattr(args, 'with_xrefs', False)
+    with_xrefs = _opt(args, 'with_xrefs', False)
     md_out = _is_md_out(args)
     p = {"addr": args.addr}
-    if getattr(args, 'out', None) and not md_out:
+    if _opt(args, 'out') and not md_out:
         p["output"] = args.out
     method = "decompile_with_xrefs" if with_xrefs else "decompile"
     r = _rpc_call(args, config, method, p)
@@ -877,7 +928,7 @@ def cmd_proxy_decompile(args, config):
 def cmd_proxy_decompile_batch(args, config):
     md_out = _is_md_out(args)
     p = {"addrs": args.addrs}
-    if getattr(args, 'out', None) and not md_out:
+    if _opt(args, 'out') and not md_out:
         p["output"] = args.out
     r = _rpc_call(args, config, "decompile_batch", p)
     if not r: return
@@ -899,8 +950,7 @@ def cmd_proxy_decompile_batch(args, config):
 
 def cmd_proxy_disasm(args, config):
     p = {"addr": args.addr}
-    if getattr(args, 'count', None) is not None: p["count"] = args.count
-    if getattr(args, 'out', None): p["output"] = args.out
+    p.update(_build_params(args, {"count": "count", "out": "output"}))
     r = _rpc_call(args, config, "disasm", p)
     if not r: return
     for ln in r.get("lines", []):
@@ -908,7 +958,7 @@ def cmd_proxy_disasm(args, config):
 
 
 def cmd_proxy_xrefs(args, config):
-    direction = getattr(args, 'direction', 'to')
+    direction = _opt(args, 'direction', 'to')
     p = {"addr": args.addr}
     if direction in ("to", "both"):
         r = _rpc_call(args, config, "get_xrefs_to", p)
@@ -928,8 +978,8 @@ def cmd_proxy_xrefs(args, config):
 
 def cmd_proxy_find_func(args, config):
     p = {"name": args.name}
-    if getattr(args, 'regex', False): p["regex"] = True
-    if getattr(args, 'max', None): p["max_results"] = args.max
+    if _opt(args, 'regex', False): p["regex"] = True
+    if _opt(args, 'max'): p["max_results"] = args.max
     r = _rpc_call(args, config, "find_func", p)
     if not r: return
     print(f"Query: '{r['query']}' ({r['total']} matches)")
@@ -969,7 +1019,7 @@ def cmd_proxy_bytes(args, config):
 
 def cmd_proxy_find_pattern(args, config):
     p = {"pattern": args.pattern}
-    if getattr(args, 'max', None): p["max_results"] = args.max
+    if _opt(args, 'max'): p["max_results"] = args.max
     r = _rpc_call(args, config, "find_bytes", p)
     if not r: return
     print(f"Pattern: '{r['pattern']}' ({r['total']} matches)")
@@ -996,33 +1046,33 @@ def cmd_proxy_methods(args, config):
 def cmd_proxy_rename(args, config):
     r = _rpc_call(args, config, "set_name", {"addr": args.addr, "name": args.name})
     if r:
-        print(f"[+] Renamed {r['addr']} -> {r['name']}")
+        _log_ok(f"Renamed {r['addr']} -> {r['name']}")
 
 
 def cmd_proxy_set_type(args, config):
     r = _rpc_call(args, config, "set_type", {"addr": args.addr, "type": args.type_str})
     if r:
-        print(f"[+] Type set at {r['addr']}: {r.get('type', '')}")
+        _log_ok(f"Type set at {r['addr']}: {r.get('type', '')}")
 
 
 def cmd_proxy_comment(args, config):
     p = {"addr": args.addr, "comment": args.text}
-    if getattr(args, 'repeatable', False): p["repeatable"] = True
-    if getattr(args, 'type', None): p["type"] = args.type
+    if _opt(args, 'repeatable', False): p["repeatable"] = True
+    if _opt(args, 'type'): p["type"] = args.type
     r = _rpc_call(args, config, "set_comment", p)
     if r:
-        print(f"[+] Comment set at {r['addr']}")
+        _log_ok(f"Comment set at {r['addr']}")
 
 
 def cmd_proxy_save(args, config):
     r = _rpc_call(args, config, "save_db")
     if r:
-        print(f"[+] Database saved: {r.get('idb_path')}")
+        _log_ok(f"Database saved: {r.get('idb_path')}")
 
 
 def cmd_proxy_exec(args, config):
     p = {"code": args.code}
-    if getattr(args, 'out', None): p["output"] = args.out
+    if _opt(args, 'out'): p["output"] = args.out
     r = _rpc_call(args, config, "exec", p)
     if not r: return
     if r.get("stdout"):
@@ -1066,47 +1116,47 @@ def cmd_proxy_summary(args, config):
             print(f"    {s['addr']}  {val}")
 
 
+def _resolve_by_hint(hint, registry):
+    """Resolve instance by ID or binary name hint. Shared by diff/code-diff."""
+    if hint in registry:
+        return hint, registry[hint]
+    matches = [(k, v) for k, v in registry.items()
+               if hint.lower() in v.get("binary", "").lower()]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        _log_err(f"No instance matching '{hint}'")
+    else:
+        _log_err(f"Multiple instances match '{hint}':")
+        for k, v in matches:
+            print(f"  {k}  {v.get('binary', '?')}")
+    return None, None
+
+
+def _get_func_map(config, iid, info, count=10000):
+    """Get {name: func_dict} from an instance. Shared by diff/compare/code-diff."""
+    port = info.get("port")
+    if not port:
+        _log_err(f"Instance {iid} has no port")
+        return None
+    resp = post_rpc(config, port, "get_functions", iid, {"count": count})
+    if "error" in resp:
+        _log_err(f"{iid}: {resp['error'].get('message')}")
+        return None
+    return {f["name"]: f for f in resp.get("result", {}).get("data", [])}
+
+
 def cmd_diff(args, config):
     """Compare functions between two instances."""
     registry = load_registry()
-    id_a = args.instance_a
-    id_b = args.instance_b
 
-    # Resolve by hint or ID
-    def resolve(hint):
-        if hint in registry:
-            return hint, registry[hint]
-        matches = [(k, v) for k, v in registry.items()
-                   if hint.lower() in v.get("binary", "").lower()]
-        if len(matches) == 1:
-            return matches[0]
-        if not matches:
-            print(f"[-] No instance matching '{hint}'")
-        else:
-            print(f"[-] Multiple instances match '{hint}':")
-            for k, v in matches:
-                print(f"  {k}  {v.get('binary', '?')}")
-        return None, None
-
-    iid_a, info_a = resolve(id_a)
+    iid_a, info_a = _resolve_by_hint(args.instance_a, registry)
     if not iid_a: return
-    iid_b, info_b = resolve(id_b)
+    iid_b, info_b = _resolve_by_hint(args.instance_b, registry)
     if not iid_b: return
 
-    # Get function lists from both
-    def get_funcs(iid, info):
-        port = info.get("port")
-        if not port:
-            print(f"[-] Instance {iid} has no port")
-            return None
-        resp = post_rpc(config, port, "get_functions", iid, {"count": 10000})
-        if "error" in resp:
-            print(f"[-] {iid}: {resp['error'].get('message')}")
-            return None
-        return {f["name"]: f for f in resp.get("result", {}).get("data", [])}
-
-    funcs_a = get_funcs(iid_a, info_a)
-    funcs_b = get_funcs(iid_b, info_b)
+    funcs_a = _get_func_map(config, iid_a, info_a)
+    funcs_b = _get_func_map(config, iid_b, info_b)
     if funcs_a is None or funcs_b is None:
         return
 
@@ -1153,30 +1203,17 @@ def cmd_diff(args, config):
             print(f"    ... and {len(size_diff) - 30} more")
 
 
-def cmd_batch(args, config, config_path):
-    """Analyze all binaries in a directory."""
-    target_dir = os.path.abspath(args.directory)
-    if not os.path.isdir(target_dir):
-        print(f"[-] Not a directory: {target_dir}")
-        return
-
-    # Supported binary extensions (common ones)
-    _BIN_EXTS = {
-        ".exe", ".dll", ".sys", ".so", ".dylib", ".o", ".obj",
-        ".elf", ".bin", ".ko", ".axf", ".hex", ".srec", ".efi",
-    }
-
-    # Find binaries
+def _find_binaries(target_dir):
+    """Find binary files in a directory by extension or magic bytes."""
     binaries = []
     for f in sorted(os.listdir(target_dir)):
         fpath = os.path.join(target_dir, f)
         if not os.path.isfile(fpath):
             continue
         ext = os.path.splitext(f)[1].lower()
-        if ext in _BIN_EXTS:
+        if ext in SUPPORTED_BINARY_EXTENSIONS:
             binaries.append(fpath)
             continue
-        # No extension -try magic bytes
         if not ext:
             try:
                 with open(fpath, "rb") as fp:
@@ -1185,105 +1222,114 @@ def cmd_batch(args, config, config_path):
                     binaries.append(fpath)
             except Exception:
                 pass
+    return binaries
 
-    if not binaries:
-        print(f"[-] No binaries found in: {target_dir}")
+
+def _start_batch_instances(batch, config, config_path, idb_dir, fresh):
+    """Start analysis instances for a batch of binaries. Returns [(iid, bname)]."""
+    started = []
+    for bpath in batch:
+        bname = os.path.basename(bpath)
+        norm_path = os.path.normcase(os.path.abspath(bpath))
+        arch_info = arch_detect(bpath)
+        instance_id = make_instance_id(bpath)
+        idb_path = get_idb_path(config, norm_path, instance_id, False, idb_dir=idb_dir)
+        log_path = os.path.join(config["paths"]["log_dir"], f"{instance_id}.log")
+
+        if not _register_instance(config, instance_id, norm_path,
+                                   arch_info, idb_path, log_path, False):
+            _log_err(f"{bname}: failed to register")
+            continue
+        try:
+            _spawn_server(config, config_path, norm_path, instance_id, idb_path, log_path, fresh)
+            fmt = arch_info.get("file_format", "?")
+            arch = arch_info.get("arch", "?")
+            bits = arch_info.get("bits", "?")
+            _log_ok(f"{bname} ({fmt} {arch} {bits}bit) -> {instance_id}")
+            started.append((instance_id, bname))
+        except Exception as e:
+            _log_err(f"{bname}: {e}")
+    return started
+
+
+def _wait_batch_instances(started, config, timeout):
+    """Wait for batch instances to reach ready/error state."""
+    deadline = time.time() + timeout
+    poll = config["analysis"]["wait_poll_interval"]
+    pending = set(iid for iid, _ in started)
+    while pending and time.time() < deadline:
+        time.sleep(poll)
+        registry = load_registry()
+        for iid in list(pending):
+            state = registry.get(iid, {}).get("state", "unknown")
+            if state in ("ready", "error"):
+                pending.discard(iid)
+
+
+def _collect_batch_results(started, config):
+    """Collect summary results from batch instances."""
+    results = []
+    registry = load_registry()
+    for iid, bname in started:
+        info = registry.get(iid, {})
+        state = info.get("state", "unknown")
+        port = info.get("port")
+        if state == "ready" and port:
+            resp = post_rpc(config, port, "summary", iid)
+            if "result" in resp:
+                r = resp["result"]
+                results.append((bname, iid, r))
+                print(f"  {bname:<30}  funcs={r['func_count']:<6}  "
+                      f"strings={r['total_strings']:<6}  "
+                      f"imports={r['total_imports']:<6}  "
+                      f"decompiler={'Y' if r['decompiler'] else 'N'}")
+            else:
+                print(f"  {bname:<30}  [ready but summary failed]")
+        else:
+            print(f"  {bname:<30}  [{state}]")
+    return results
+
+
+def cmd_batch(args, config, config_path):
+    """Analyze all binaries in a directory."""
+    target_dir = os.path.abspath(args.directory)
+    if not os.path.isdir(target_dir):
+        _log_err(f"Not a directory: {target_dir}")
         return
 
-    idb_dir = getattr(args, 'idb_dir', None)
-    if not idb_dir:
-        idb_dir = os.environ.get('IDA_IDB_DIR')
-    fresh = getattr(args, 'fresh', False)
-    timeout = getattr(args, 'timeout', 300)
+    binaries = _find_binaries(target_dir)
+    if not binaries:
+        _log_err(f"No binaries found in: {target_dir}")
+        return
+
+    idb_dir = _opt(args, 'idb_dir') or os.environ.get('IDA_IDB_DIR')
+    fresh = _opt(args, 'fresh', False)
+    timeout = _opt(args, 'timeout', 300)
     max_concurrent = config["analysis"]["max_instances"]
 
-    print(f"[*] Found {len(binaries)} binaries in {target_dir}")
-    print(f"[*] Max concurrent: {max_concurrent}, Timeout: {timeout}s")
+    _log_info(f"Found {len(binaries)} binaries in {target_dir}")
+    _log_info(f"Max concurrent: {max_concurrent}, Timeout: {timeout}s")
     if idb_dir:
-        print(f"[*] IDB dir: {idb_dir}")
+        _log_info(f"IDB dir: {idb_dir}")
     print()
 
-    # Process in batches
     results = []
     for batch_start in range(0, len(binaries), max_concurrent):
         batch = binaries[batch_start:batch_start + max_concurrent]
-        started = []
-
-        # Start batch
-        for bpath in batch:
-            bname = os.path.basename(bpath)
-            arch_info = arch_detect(bpath)
-            instance_id = make_instance_id(bpath)
-            idb_path = get_idb_path(config, os.path.normcase(os.path.abspath(bpath)),
-                                     instance_id, False, idb_dir=idb_dir)
-
-            if not _register_instance(config, instance_id, os.path.normcase(os.path.abspath(bpath)),
-                                       arch_info, idb_path,
-                                       os.path.join(config["paths"]["log_dir"], f"{instance_id}.log"),
-                                       False):
-                print(f"  [-] {bname}: failed to register")
-                continue
-
-            try:
-                proc = _spawn_server(config, config_path, os.path.normcase(os.path.abspath(bpath)),
-                                      instance_id, idb_path,
-                                      os.path.join(config["paths"]["log_dir"], f"{instance_id}.log"),
-                                      fresh)
-                fmt = arch_info.get("file_format", "?")
-                arch = arch_info.get("arch", "?")
-                bits = arch_info.get("bits", "?")
-                print(f"  [+] {bname} ({fmt} {arch} {bits}bit) -> {instance_id}")
-                started.append((instance_id, bname))
-            except Exception as e:
-                print(f"  [-] {bname}: {e}")
-
+        started = _start_batch_instances(batch, config, config_path, idb_dir, fresh)
         if not started:
             continue
+        _log_info(f"Waiting for {len(started)} instances...")
+        _wait_batch_instances(started, config, timeout)
+        results.extend(_collect_batch_results(started, config))
 
-        # Wait for all in batch
-        print(f"\n[*] Waiting for {len(started)} instances...")
-        deadline = time.time() + timeout
-        poll = config["analysis"]["wait_poll_interval"]
-        pending = set(iid for iid, _ in started)
-        while pending and time.time() < deadline:
-            time.sleep(poll)
-            registry = load_registry()
-            for iid in list(pending):
-                info = registry.get(iid, {})
-                state = info.get("state", "unknown")
-                if state == "ready":
-                    pending.discard(iid)
-                elif state == "error":
-                    pending.discard(iid)
-
-        # Collect results
-        registry = load_registry()
-        for iid, bname in started:
-            info = registry.get(iid, {})
-            state = info.get("state", "unknown")
-            port = info.get("port")
-            if state == "ready" and port:
-                resp = post_rpc(config, port, "summary", iid)
-                if "result" in resp:
-                    r = resp["result"]
-                    results.append((bname, iid, r))
-                    print(f"  {bname:<30}  funcs={r['func_count']:<6}  "
-                          f"strings={r['total_strings']:<6}  "
-                          f"imports={r['total_imports']:<6}  "
-                          f"decompiler={'Y' if r['decompiler'] else 'N'}")
-                else:
-                    print(f"  {bname:<30}  [ready but summary failed]")
-            else:
-                print(f"  {bname:<30}  [{state}]")
-
-    # Summary
-    print(f"\n[+] Batch complete: {len(results)}/{len(binaries)} analyzed")
+    _log_ok(f"Batch complete: {len(results)}/{len(binaries)} analyzed")
     if results:
         print(f"\n  Active instances:")
         for bname, iid, _ in results:
             print(f"    {iid}  {bname}")
         print(f"\n  Use 'ida-cli -b <hint> decompile <addr>' to analyze further")
-        if not getattr(args, 'keep', False):
+        if not _opt(args, 'keep', False):
             print(f"  Use 'ida-cli stop <id>' to stop, or 'ida-cli cleanup' to clean all")
 
 
@@ -1314,14 +1360,14 @@ def _save_bookmarks(bookmarks):
 
 
 def cmd_bookmark(args, config):
-    action = getattr(args, 'action', 'list')
+    action = _opt(args, 'action', 'list')
     bookmarks = _load_bookmarks()
 
     if action == "add":
         addr = args.addr
         tag = args.tag
-        note = getattr(args, 'note', None) or ""
-        binary_hint = getattr(args, 'binary_hint', None) or ""
+        note = _opt(args, 'note') or ""
+        binary_hint = _opt(args, 'binary_hint') or ""
 
         # Try to resolve binary name from active instance
         binary = binary_hint
@@ -1338,7 +1384,7 @@ def cmd_bookmark(args, config):
         # Check for duplicate
         for bm in bookmarks[binary]:
             if bm["addr"] == addr and bm["tag"] == tag:
-                print(f"[!] Bookmark already exists: {addr} [{tag}]")
+                _log_warn(f"Bookmark already exists: {addr} [{tag}]")
                 return
 
         bookmarks[binary].append({
@@ -1348,11 +1394,11 @@ def cmd_bookmark(args, config):
             "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         })
         _save_bookmarks(bookmarks)
-        print(f"[+] Bookmark added: {addr} [{tag}] {note}")
+        _log_ok(f"Bookmark added: {addr} [{tag}] {note}")
 
     elif action == "remove":
         addr = args.addr
-        binary_hint = getattr(args, 'binary_hint', None) or ""
+        binary_hint = _opt(args, 'binary_hint') or ""
         removed = False
         for binary in list(bookmarks.keys()):
             if binary_hint and binary_hint.lower() not in binary.lower():
@@ -1365,13 +1411,13 @@ def cmd_bookmark(args, config):
                 del bookmarks[binary]
         if removed:
             _save_bookmarks(bookmarks)
-            print(f"[+] Bookmark removed: {addr}")
+            _log_ok(f"Bookmark removed: {addr}")
         else:
-            print(f"[-] No bookmark found at {addr}")
+            _log_err(f"No bookmark found at {addr}")
 
     else:  # list
-        tag_filter = getattr(args, 'tag', None)
-        binary_filter = getattr(args, 'binary_hint', None)
+        tag_filter = _opt(args, 'tag')
+        binary_filter = _opt(args, 'binary_hint')
         if not bookmarks:
             print("[*] No bookmarks. Use: ida-cli bookmark add <addr> <tag> [--note 'text']")
             return
@@ -1448,8 +1494,75 @@ _PROFILES = {
 }
 
 
+_PROFILE_RPC_MAP = {
+    "summary": "summary",
+    "segments": "get_segments",
+    "strings": "get_strings",
+    "imports": "get_imports",
+    "exports": "get_exports",
+    "find_func": "find_func",
+    "functions": "get_functions",
+}
+
+
+def _parse_profile_step(step, method):
+    """Parse a profile step string into RPC params dict."""
+    parts = step.split()
+    params = {}
+    i = 1
+    while i < len(parts):
+        if parts[i] == "--filter" and i + 1 < len(parts):
+            params["filter"] = parts[i + 1]; i += 2
+        elif parts[i] == "--count" and i + 1 < len(parts):
+            params["count"] = int(parts[i + 1]); i += 2
+        elif parts[i] == "--max" and i + 1 < len(parts):
+            params["max_results"] = int(parts[i + 1]); i += 2
+        elif parts[i] == "--regex":
+            params["regex"] = True; i += 1
+            if i < len(parts) and not parts[i].startswith("--"):
+                params["name"] = parts[i].strip("'\""); i += 1
+        else:
+            if method == "find_func" and "name" not in params:
+                params["name"] = parts[i].strip("'\"")
+            i += 1
+    return params
+
+
+def _display_profile_result(method, r):
+    """Display a profile step result."""
+    if method == "summary":
+        print(f"    Functions: {r.get('func_count')}  "
+              f"Strings: {r.get('total_strings')}  "
+              f"Imports: {r.get('total_imports')}  "
+              f"Decompiler: {r.get('decompiler')}")
+    elif method in ("strings", "imports", "exports", "functions"):
+        data = r.get("data", [])
+        total = r.get("total", 0)
+        print(f"    Total: {total}, Showing: {len(data)}")
+        for d in data[:10]:
+            if "value" in d:
+                print(f"      {d['addr']}  {d['value'][:60]}")
+            elif "module" in d:
+                print(f"      {d['addr']}  {d.get('module', ''):<20}  {d['name']}")
+            elif "name" in d:
+                print(f"      {d['addr']}  {d['name']}")
+        if len(data) > 10:
+            print(f"      ... ({len(data) - 10} more)")
+    elif method == "find_func":
+        matches = r.get("matches", [])
+        print(f"    Found: {r.get('total', 0)}")
+        for m in matches[:10]:
+            print(f"      {m['addr']}  {m['name']}")
+        if len(matches) > 10:
+            print(f"      ... ({len(matches) - 10} more)")
+    elif method == "segments":
+        for s in r.get("data", []):
+            print(f"      {s['start_addr']}-{s['end_addr']}  "
+                  f"{s.get('name') or '':<12}  {s.get('perm') or ''}")
+
+
 def cmd_profile(args, config):
-    action = getattr(args, 'action', 'list')
+    action = _opt(args, 'action', 'list')
 
     if action == "list":
         print("  Available profiles:")
@@ -1460,235 +1573,128 @@ def cmd_profile(args, config):
     if action == "run":
         profile_name = args.profile_name
         if profile_name not in _PROFILES:
-            print(f"[-] Unknown profile: {profile_name}")
+            _log_err(f"Unknown profile: {profile_name}")
             print(f"    Available: {', '.join(_PROFILES.keys())}")
             return
 
         profile = _PROFILES[profile_name]
-        print(f"[*] Running profile: {profile_name} -{profile['description']}")
+        _log_info(f"Running profile: {profile_name} - {profile['description']}")
         print()
 
         iid, info = resolve_instance(args, config)
         if not iid:
             return
-        if info.get("state") != "ready":
-            print(f"[-] Instance {iid} is not ready")
+        port, ok = _ensure_ready(iid, info)
+        if not ok:
             return
-        port = info.get("port")
 
-        out_dir = getattr(args, 'out_dir', None)
+        out_dir = _opt(args, 'out_dir')
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
 
         for step in profile["analysis_steps"]:
-            parts = step.split()
-            method = parts[0]
+            method = step.split()[0]
             print(f"  --- {step} ---")
-
-            # Parse simple params from step string
-            params = {}
-            i = 1
-            while i < len(parts):
-                if parts[i] == "--filter" and i + 1 < len(parts):
-                    params["filter"] = parts[i + 1]
-                    i += 2
-                elif parts[i] == "--count" and i + 1 < len(parts):
-                    params["count"] = int(parts[i + 1])
-                    i += 2
-                elif parts[i] == "--max" and i + 1 < len(parts):
-                    params["max_results"] = int(parts[i + 1])
-                    i += 2
-                elif parts[i] == "--regex":
-                    params["regex"] = True
-                    i += 1
-                    if i < len(parts) and not parts[i].startswith("--"):
-                        params["name"] = parts[i].strip("'\"")
-                        i += 1
-                else:
-                    # Positional arg (e.g., name for find_func)
-                    if method == "find_func" and "name" not in params:
-                        params["name"] = parts[i].strip("'\"")
-                    i += 1
-
+            params = _parse_profile_step(step, method)
             if out_dir:
                 params["output"] = os.path.join(out_dir, f"{method}_{params.get('filter', 'all')}.txt")
-
-            # Map CLI command name to RPC method
-            rpc_map = {
-                "summary": "summary",
-                "segments": "get_segments",
-                "strings": "get_strings",
-                "imports": "get_imports",
-                "exports": "get_exports",
-                "find_func": "find_func",
-                "functions": "get_functions",
-            }
-            rpc_method = rpc_map.get(method, method)
-
+            rpc_method = _PROFILE_RPC_MAP.get(method, method)
             resp = post_rpc(config, port, rpc_method, iid, params=params)
             if "error" in resp:
-                print(f"    [-] {resp['error'].get('message', '?')}")
+                _log_err(f"  {resp['error'].get('message', '?')}")
                 continue
-
-            r = resp.get("result", {})
-            if method == "summary":
-                print(f"    Functions: {r.get('func_count')}  "
-                      f"Strings: {r.get('total_strings')}  "
-                      f"Imports: {r.get('total_imports')}  "
-                      f"Decompiler: {r.get('decompiler')}")
-            elif method in ("strings", "imports", "exports", "functions"):
-                data = r.get("data", [])
-                total = r.get("total", 0)
-                showing = len(data)
-                print(f"    Total: {total}, Showing: {showing}")
-                for d in data[:10]:
-                    if "value" in d:
-                        print(f"      {d['addr']}  {d['value'][:60]}")
-                    elif "module" in d:
-                        print(f"      {d['addr']}  {d.get('module', ''):<20}  {d['name']}")
-                    elif "name" in d:
-                        print(f"      {d['addr']}  {d['name']}")
-                if showing > 10:
-                    print(f"      ... ({showing - 10} more)")
-            elif method == "find_func":
-                matches = r.get("matches", [])
-                print(f"    Found: {r.get('total', 0)}")
-                for m in matches[:10]:
-                    print(f"      {m['addr']}  {m['name']}")
-                if len(matches) > 10:
-                    print(f"      ... ({len(matches) - 10} more)")
-            elif method == "segments":
-                for s in r.get("data", []):
-                    print(f"      {s['start_addr']}-{s['end_addr']}  "
-                          f"{s.get('name') or '':<12}  {s.get('perm') or ''}")
+            _display_profile_result(method, resp.get("result", {}))
             print()
 
-        print(f"[+] Profile '{profile_name}' complete")
+        _log_ok(f"Profile '{profile_name}' complete")
         if out_dir:
             print(f"    Results saved to: {out_dir}")
 
 
-def cmd_report(args, config):
-    """Generate markdown/HTML analysis report."""
-    iid, info = resolve_instance(args, config)
-    if not iid:
-        return
-    if info.get("state") != "ready":
-        print(f"[-] Instance {iid} is not ready")
-        return
-    port = info.get("port")
-    out_path = args.output
-    binary_name = info.get("binary", "unknown")
-
+def _collect_report_sections(config, port, iid, binary_name, func_addrs):
+    """Collect all report sections from the running instance."""
+    import datetime
     sections = []
 
-    # Title
-    import datetime
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     sections.append(f"# Analysis Report: {os.path.basename(binary_name)}")
     sections.append(f"**Generated**: {ts}  ")
     sections.append(f"**Binary**: `{binary_name}`")
     sections.append("")
 
-    # Summary
-    print("[*] Collecting summary...")
+    _log_info("Collecting summary...")
     resp = post_rpc(config, port, "summary", iid)
     if "result" in resp:
         sections.append(_md_summary(resp["result"]))
 
-    # Segments (already in summary, skip if present)
-
-    # Imports
-    print("[*] Collecting imports...")
-    resp = post_rpc(config, port, "get_imports", iid, {"count": 100})
-    if "result" in resp:
+    # Imports / Exports / Strings
+    for label, method, count, fmt_row in [
+        ("Imports", "get_imports", 100,
+         lambda d: f"| `{d['addr']}` | {d.get('module', '')} | {d['name']} |"),
+        ("Exports", "get_exports", 100,
+         lambda d: f"| `{d['addr']}` | {d['name']} |"),
+        ("Strings", "get_strings", 50,
+         lambda d: f"| `{d['addr']}` | {d.get('value', '').replace('|', chr(92)+'|')} |"),
+    ]:
+        _log_info(f"Collecting {label.lower()}...")
+        resp = post_rpc(config, port, method, iid, {"count": count})
+        if "result" not in resp:
+            continue
         data = resp["result"].get("data", [])
         total = resp["result"].get("total", 0)
-        if data:
-            sections.append(f"## Imports ({total} total, showing {len(data)})")
-            sections.append("| Address | Module | Name |")
-            sections.append("|---------|--------|------|")
-            for d in data:
-                sections.append(f"| `{d['addr']}` | {d.get('module', '')} | {d['name']} |")
-            sections.append("")
-
-    # Exports
-    print("[*] Collecting exports...")
-    resp = post_rpc(config, port, "get_exports", iid, {"count": 100})
-    if "result" in resp:
-        data = resp["result"].get("data", [])
-        total = resp["result"].get("total", 0)
-        if data:
-            sections.append(f"## Exports ({total} total, showing {len(data)})")
-            sections.append("| Address | Name |")
-            sections.append("|---------|------|")
-            for d in data:
-                sections.append(f"| `{d['addr']}` | {d['name']} |")
-            sections.append("")
-
-    # Strings sample
-    print("[*] Collecting strings...")
-    resp = post_rpc(config, port, "get_strings", iid, {"count": 50})
-    if "result" in resp:
-        data = resp["result"].get("data", [])
-        total = resp["result"].get("total", 0)
-        if data:
-            sections.append(f"## Strings ({total} total, showing {len(data)})")
-            sections.append("| Address | Value |")
-            sections.append("|---------|-------|")
-            for d in data:
-                val = d.get("value", "").replace("|", "\\|")
-                sections.append(f"| `{d['addr']}` | {val} |")
-            sections.append("")
-
-    # Decompile specific functions if requested
-    func_addrs = getattr(args, 'functions', None) or []
-    if func_addrs:
-        sections.append("## Decompiled Functions")
+        if not data:
+            continue
+        if label == "Imports":
+            sections += [f"## {label} ({total} total, showing {len(data)})",
+                         "| Address | Module | Name |", "|---------|--------|------|"]
+        elif label == "Exports":
+            sections += [f"## {label} ({total} total, showing {len(data)})",
+                         "| Address | Name |", "|---------|------|"]
+        else:
+            sections += [f"## {label} ({total} total, showing {len(data)})",
+                         "| Address | Value |", "|---------|-------|"]
+        for d in data:
+            sections.append(fmt_row(d))
         sections.append("")
+
+    # Decompile specific functions
+    if func_addrs:
+        sections += ["## Decompiled Functions", ""]
         for addr in func_addrs:
-            print(f"[*] Decompiling {addr}...")
+            _log_info(f"Decompiling {addr}...")
             resp = post_rpc(config, port, "decompile_with_xrefs", iid, {"addr": addr})
             if "result" in resp:
                 sections.append(_md_decompile(resp["result"], with_xrefs=True))
             else:
                 err = resp.get("error", {}).get("message", "unknown error")
-                sections.append(f"### `{addr}` - Error")
-                sections.append(f"> {err}")
+                sections += [f"### `{addr}` - Error", f"> {err}"]
             sections.append("")
 
     # Bookmarks
     bookmarks = _load_bookmarks()
     if bookmarks:
-        bm_for_binary = {}
-        for bname, bms in bookmarks.items():
-            if os.path.basename(binary_name).lower() in bname.lower():
-                bm_for_binary[bname] = bms
+        bm_for_binary = {bn: bms for bn, bms in bookmarks.items()
+                         if os.path.basename(binary_name).lower() in bn.lower()}
         if bm_for_binary:
-            sections.append("## Bookmarks")
-            sections.append("| Address | Tag | Note |")
-            sections.append("|---------|-----|------|")
-            for bname, bms in bm_for_binary.items():
+            sections += ["## Bookmarks", "| Address | Tag | Note |", "|---------|-----|------|"]
+            for bms in bm_for_binary.values():
                 for bm in bms:
                     note = bm.get("note", "").replace("|", "\\|")
                     sections.append(f"| `{bm['addr']}` | {bm['tag']} | {note} |")
             sections.append("")
 
-    # Footer
-    sections.append("---")
-    sections.append("*Generated by ida-cli report*")
+    sections += ["---", "*Generated by ida-cli report*"]
+    return "\n".join(sections) + "\n"
 
-    content = "\n".join(sections) + "\n"
 
-    # HTML conversion
-    if out_path.lower().endswith('.html'):
-        try:
-            import markdown
-            html_body = markdown.markdown(content, extensions=["tables"])
-        except ImportError:
-            # Minimal HTML wrapping without markdown library
-            html_body = f"<pre>{content}</pre>"
-        html = f"""<!DOCTYPE html>
+def _render_html(content, binary_name):
+    """Convert markdown content to HTML report."""
+    try:
+        import markdown
+        html_body = markdown.markdown(content, extensions=["tables"])
+    except ImportError:
+        html_body = f"<pre>{content}</pre>"
+    return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Report: {os.path.basename(binary_name)}</title>
 <style>
 body {{ font-family: -apple-system, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; }}
@@ -1700,11 +1706,27 @@ pre {{ padding: 12px; overflow-x: auto; }}
 </style></head><body>
 {html_body}
 </body></html>"""
-        _save_local(out_path, html)
+
+
+def cmd_report(args, config):
+    """Generate markdown/HTML analysis report."""
+    iid, info = resolve_instance(args, config)
+    if not iid:
+        return
+    port, ok = _ensure_ready(iid, info)
+    if not ok:
+        return
+    out_path = args.output
+    binary_name = info.get("binary", "unknown")
+    func_addrs = _opt(args, 'functions') or []
+
+    content = _collect_report_sections(config, port, iid, binary_name, func_addrs)
+
+    if out_path.lower().endswith('.html'):
+        _save_local(out_path, _render_html(content, binary_name))
     else:
         _save_local(out_path, content)
-
-    print(f"[+] Report generated: {out_path}")
+    _log_ok(f"Report generated: {out_path}")
 
 
 # ─────────────────────────────────────────────
@@ -1716,24 +1738,23 @@ def cmd_shell(args, config):
     iid, info = resolve_instance(args, config)
     if not iid:
         return
-    if info.get("state") != "ready":
-        print(f"[-] Instance {iid} is not ready")
+    port, ok = _ensure_ready(iid, info)
+    if not ok:
         return
-    port = info.get("port")
     binary = os.path.basename(info.get("binary", "?"))
-    print(f"[*] IDA Python Shell - {binary} ({iid})")
-    print("[*] Type 'exit' or Ctrl+C to quit")
+    _log_info(f"IDA Python Shell - {binary} ({iid})")
+    _log_info("Type 'exit' or Ctrl+C to quit")
     print()
     while True:
         try:
             code = input(f"ida({binary})>>> ")
         except (EOFError, KeyboardInterrupt):
-            print("\n[*] Shell closed")
+            _log_info("Shell closed")
             break
         if not code.strip():
             continue
         if code.strip() in ("exit", "quit"):
-            print("[*] Shell closed")
+            _log_info("Shell closed")
             break
         # Multi-line: if line ends with ':', collect until blank line
         if code.rstrip().endswith(":"):
@@ -1749,7 +1770,7 @@ def cmd_shell(args, config):
             code = "\n".join(lines)
         resp = post_rpc(config, port, "exec", iid, {"code": code})
         if "error" in resp:
-            print(f"[-] {resp['error'].get('message', '?')}")
+            _log_err(resp['error'].get('message', '?'))
         else:
             r = resp.get("result", {})
             if r.get("stdout"):
@@ -1764,10 +1785,10 @@ def cmd_shell(args, config):
 
 def cmd_annotations(args, config):
     """Export or import analysis annotations."""
-    action = getattr(args, 'action', 'export')
+    action = _opt(args, 'action', 'export')
 
     if action == "export":
-        out_path = getattr(args, 'output', None) or "annotations.json"
+        out_path = _opt(args, 'output') or "annotations.json"
         p = {}
         r = _rpc_call(args, config, "export_annotations", p)
         if not r:
@@ -1782,7 +1803,7 @@ def cmd_annotations(args, config):
     elif action == "import":
         in_path = args.input_file
         if not os.path.isfile(in_path):
-            print(f"[-] File not found: {in_path}")
+            _log_err(f"File not found: {in_path}")
             return
         with open(in_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -1800,14 +1821,14 @@ def cmd_annotations(args, config):
 
 def cmd_callgraph(args, config):
     """Generate function call graph."""
-    fmt = getattr(args, 'format', 'mermaid') or 'mermaid'
-    depth = getattr(args, 'depth', 3)
-    direction = getattr(args, 'direction', 'callees')
+    fmt = _opt(args, 'format', 'mermaid') or 'mermaid'
+    depth = _opt(args, 'depth', 3)
+    direction = _opt(args, 'direction', 'callees')
     p = {"addr": args.addr, "depth": depth, "direction": direction}
     r = _rpc_call(args, config, "callgraph", p)
     if not r:
         return
-    out_path = getattr(args, 'out', None)
+    out_path = _opt(args, 'out')
     print(f"  Root: {r.get('root_name', '')} ({r.get('root', '')})")
     print(f"  Nodes: {r.get('nodes', 0)}, Edges: {r.get('edges', 0)}")
     if fmt == "dot":
@@ -1845,7 +1866,7 @@ def cmd_patch(args, config):
 def cmd_search_const(args, config):
     """Search for immediate/constant values."""
     p = {"value": args.value}
-    if getattr(args, 'max', None):
+    if _opt(args, 'max'):
         p["max_results"] = args.max
     r = _rpc_call(args, config, "search_const", p)
     if not r:
@@ -1863,12 +1884,10 @@ def cmd_search_const(args, config):
 
 def cmd_structs(args, config):
     """Manage structs and unions."""
-    action = getattr(args, 'action', 'list')
+    action = _opt(args, 'action', 'list')
 
     if action == "list":
-        p = {}
-        if getattr(args, 'filter', None):
-            p["filter"] = args.filter
+        p = _build_params(args, {"filter": "filter"})
         r = _rpc_call(args, config, "list_structs", p)
         if not r:
             return
@@ -1890,10 +1909,10 @@ def cmd_structs(args, config):
 
     elif action == "create":
         p = {"name": args.name}
-        if getattr(args, 'union', False):
+        if _opt(args, 'union', False):
             p["is_union"] = True
         members = []
-        for mdef in (getattr(args, 'members', None) or []):
+        for mdef in (_opt(args, 'members') or []):
             parts = mdef.split(":")
             mname = parts[0]
             msize = int(parts[1]) if len(parts) > 1 else 1
@@ -1912,10 +1931,10 @@ def cmd_structs(args, config):
 
 def cmd_snapshot(args, config):
     """Manage IDB snapshots."""
-    action = getattr(args, 'action', 'list')
+    action = _opt(args, 'action', 'list')
 
     if action == "save":
-        desc = getattr(args, 'description', 'Snapshot') or 'Snapshot'
+        desc = _opt(args, 'description', 'Snapshot') or 'Snapshot'
         r = _rpc_call(args, config, "snapshot_save", {"description": desc})
         if not r:
             return
@@ -1950,77 +1969,13 @@ def cmd_snapshot(args, config):
 # Compare (patch diffing)
 # ─────────────────────────────────────────────
 
-def cmd_compare(args, config, config_path):
-    """Compare two versions of a binary (patch diffing)."""
-    binary_a = os.path.abspath(args.binary_a)
-    binary_b = os.path.abspath(args.binary_b)
-    if not os.path.isfile(binary_a):
-        print(f"[-] File not found: {binary_a}")
-        return
-    if not os.path.isfile(binary_b):
-        print(f"[-] File not found: {binary_b}")
-        return
-
-    idb_dir = getattr(args, 'idb_dir', None) or os.environ.get("IDA_IDB_DIR") or "."
-
-    print(f"[*] Starting instances...")
-    # Start both instances
-    class FakeArgs:
-        def __init__(self, binary):
-            self.binary = binary
-            self.idb_dir = idb_dir
-            self.fresh = False
-            self.force = True
-            self.config = args.config if hasattr(args, 'config') else None
-    fa = FakeArgs(binary_a)
-    fb = FakeArgs(binary_b)
-    cmd_start(fa, config, config_path)
-    cmd_start(fb, config, config_path)
-
-    # Wait for both
-    registry = load_registry()
-    instances = []
-    for iid, info in registry.items():
-        bp = os.path.abspath(info.get("binary", ""))
-        if bp in (binary_a, binary_b) and info.get("state") in ("analyzing", "ready"):
-            instances.append((iid, info, bp))
-
-    if len(instances) < 2:
-        print("[-] Could not start both instances")
-        return
-
-    print("[*] Waiting for analysis...")
-    for iid, info, _ in instances:
-        class WaitArgs:
-            pass
-        wa = WaitArgs()
-        wa.instance_id = iid
-        wa.timeout = 300
-        cmd_wait(wa, config)
-
-    # Get function lists from both
-    def get_func_data(iid, info):
-        port = info.get("port")
-        resp = post_rpc(config, port, "get_functions", iid, {"count": 10000})
-        if "error" in resp:
-            return {}
-        return {f["name"]: f for f in resp.get("result", {}).get("data", [])}
-
-    ia, ib = instances[0], instances[1]
-    funcs_a = get_func_data(ia[0], ia[1])
-    funcs_b = get_func_data(ib[0], ib[1])
-
-    if not funcs_a or not funcs_b:
-        print("[-] Could not get function lists")
-        return
-
+def _compare_func_maps(funcs_a, funcs_b):
+    """Compare two function maps. Returns (added, removed, modified, identical)."""
     names_a = set(funcs_a.keys())
     names_b = set(funcs_b.keys())
     added = names_b - names_a
     removed = names_a - names_b
     common = names_a & names_b
-
-    # Compare sizes of common functions
     modified = []
     identical = 0
     for name in common:
@@ -2030,47 +1985,94 @@ def cmd_compare(args, config, config_path):
             modified.append((name, funcs_a[name]["addr"], sa, funcs_b[name]["addr"], sb))
         else:
             identical += 1
+    modified.sort(key=lambda x: abs(x[4] - x[2]), reverse=True)
+    return added, removed, modified, identical
 
-    name_a = os.path.basename(binary_a)
-    name_b = os.path.basename(binary_b)
 
+def _display_diff_results(name_a, name_b, funcs_a, funcs_b,
+                          added, removed, modified, identical, limit=50):
+    """Display patch diff results."""
     print(f"\n  === Patch Diff: {name_a} vs {name_b} ===")
-    print(f"  Functions: {len(names_a)} vs {len(names_b)}")
+    print(f"  Functions: {len(funcs_a)} vs {len(funcs_b)}")
     print(f"  Identical: {identical}")
     print(f"  Modified:  {len(modified)}")
     print(f"  Added:     {len(added)}")
     print(f"  Removed:   {len(removed)}")
 
     if modified:
-        modified.sort(key=lambda x: abs(x[4] - x[2]), reverse=True)
         print(f"\n  Modified functions ({len(modified)}):")
-        for name, addr_a, sa, addr_b, sb in modified[:50]:
+        for name, addr_a, sa, addr_b, sb in modified[:limit]:
             delta = sb - sa
             sign = "+" if delta > 0 else ""
             print(f"    {name:<50}  {sa} -> {sb} ({sign}{delta})")
-        if len(modified) > 50:
-            print(f"    ... and {len(modified) - 50} more")
+        if len(modified) > limit:
+            print(f"    ... and {len(modified) - limit} more")
 
-    if added:
-        print(f"\n  Added functions ({len(added)}):")
-        for name in sorted(added)[:30]:
-            print(f"    {funcs_b[name]['addr']}  {name}")
-        if len(added) > 30:
-            print(f"    ... and {len(added) - 30} more")
+    for label, names, funcs in [("Added", added, funcs_b), ("Removed", removed, funcs_a)]:
+        if names:
+            print(f"\n  {label} functions ({len(names)}):")
+            for name in sorted(names)[:30]:
+                print(f"    {funcs[name]['addr']}  {name}")
+            if len(names) > 30:
+                print(f"    ... and {len(names) - 30} more")
 
-    if removed:
-        print(f"\n  Removed functions ({len(removed)}):")
-        for name in sorted(removed)[:30]:
-            print(f"    {funcs_a[name]['addr']}  {name}")
-        if len(removed) > 30:
-            print(f"    ... and {len(removed) - 30} more")
 
-    # Save report if --out
-    out_path = getattr(args, 'out', None)
+def cmd_compare(args, config, config_path):
+    """Compare two versions of a binary (patch diffing)."""
+    binary_a = os.path.abspath(args.binary_a)
+    binary_b = os.path.abspath(args.binary_b)
+    for path in (binary_a, binary_b):
+        if not os.path.isfile(path):
+            _log_err(f"File not found: {path}")
+            return
+
+    idb_dir = _opt(args, 'idb_dir') or os.environ.get("IDA_IDB_DIR") or "."
+
+    _log_info("Starting instances...")
+    class FakeArgs:
+        def __init__(self, binary):
+            self.binary = binary
+            self.idb_dir = idb_dir
+            self.fresh = False
+            self.force = True
+            self.config = _opt(args, 'config')
+    cmd_start(FakeArgs(binary_a), config, config_path)
+    cmd_start(FakeArgs(binary_b), config, config_path)
+
+    registry = load_registry()
+    instances = [(iid, info, os.path.abspath(info.get("binary", "")))
+                 for iid, info in registry.items()
+                 if os.path.abspath(info.get("binary", "")) in (binary_a, binary_b)
+                 and info.get("state") in ("analyzing", "ready")]
+
+    if len(instances) < 2:
+        _log_err("Could not start both instances")
+        return
+
+    _log_info("Waiting for analysis...")
+    for iid, info, _ in instances:
+        class WaitArgs: pass
+        wa = WaitArgs()
+        wa.id = iid
+        wa.timeout = 300
+        cmd_wait(wa, config)
+
+    ia, ib = instances[0], instances[1]
+    funcs_a = _get_func_map(config, ia[0], ia[1])
+    funcs_b = _get_func_map(config, ib[0], ib[1])
+    if not funcs_a or not funcs_b:
+        _log_err("Could not get function lists")
+        return
+
+    added, removed, modified, identical = _compare_func_maps(funcs_a, funcs_b)
+    _display_diff_results(os.path.basename(binary_a), os.path.basename(binary_b),
+                          funcs_a, funcs_b, added, removed, modified, identical)
+
+    out_path = _opt(args, 'out')
     if out_path:
         report = {
             "binary_a": binary_a, "binary_b": binary_b,
-            "functions_a": len(names_a), "functions_b": len(names_b),
+            "functions_a": len(funcs_a), "functions_b": len(funcs_b),
             "identical": identical,
             "modified": [{"name": n, "size_a": sa, "size_b": sb} for n, _, sa, _, sb in modified],
             "added": sorted(added),
@@ -2085,11 +2087,11 @@ def cmd_compare(args, config, config_path):
 
 def cmd_enums(args, config):
     """Manage enums."""
-    action = getattr(args, 'action', 'list')
+    action = _opt(args, 'action', 'list')
 
     if action == "list":
         p = {}
-        if getattr(args, 'filter', None):
+        if _opt(args, 'filter'):
             p["filter"] = args.filter
         r = _rpc_call(args, config, "list_enums", p)
         if not r:
@@ -2109,7 +2111,7 @@ def cmd_enums(args, config):
     elif action == "create":
         p = {"name": args.name}
         members = []
-        for mdef in (getattr(args, 'members', None) or []):
+        for mdef in (_opt(args, 'members') or []):
             parts = mdef.split("=")
             mname = parts[0].strip()
             mval = parts[1].strip() if len(parts) > 1 else ""
@@ -2129,11 +2131,11 @@ def cmd_enums(args, config):
 def cmd_search_code(args, config):
     """Search within decompiled pseudocode."""
     p = {"query": args.query}
-    if getattr(args, 'max', None):
+    if _opt(args, 'max'):
         p["max_results"] = args.max
-    if getattr(args, 'max_funcs', None):
+    if _opt(args, 'max_funcs'):
         p["max_funcs"] = args.max_funcs
-    if getattr(args, 'case_sensitive', False):
+    if _opt(args, 'case_sensitive', False):
         p["case_sensitive"] = True
     r = _rpc_call(args, config, "search_code", p)
     if not r:
@@ -2155,22 +2157,14 @@ def cmd_code_diff(args, config):
 
     id_a = args.instance_a
     id_b = args.instance_b
-    func_names = getattr(args, 'functions', None) or []
+    func_names = _opt(args, 'functions') or []
 
     registry = load_registry()
 
-    def resolve(hint):
-        for iid, info in registry.items():
-            binary = os.path.basename(info.get("binary", ""))
-            if hint.lower() in binary.lower() or hint == iid:
-                return iid, info
-        print(f"[-] Cannot resolve: {hint}")
-        return None, None
-
-    iid_a, info_a = resolve(id_a)
+    iid_a, info_a = _resolve_by_hint(id_a, registry)
     if not iid_a:
         return
-    iid_b, info_b = resolve(id_b)
+    iid_b, info_b = _resolve_by_hint(id_b, registry)
     if not iid_b:
         return
 
@@ -2182,7 +2176,7 @@ def cmd_code_diff(args, config):
         resp_a = post_rpc(config, port_a, "get_functions", iid_a, {"count": 10000})
         resp_b = post_rpc(config, port_b, "get_functions", iid_b, {"count": 10000})
         if "error" in resp_a or "error" in resp_b:
-            print("[-] Cannot get function lists")
+            _log_err("Cannot get function lists")
             return
         funcs_a = {f["name"]: f for f in resp_a.get("result", {}).get("data", [])}
         funcs_b = {f["name"]: f for f in resp_b.get("result", {}).get("data", [])}
@@ -2195,7 +2189,7 @@ def cmd_code_diff(args, config):
         func_names = changed[:10]
         print(f"  Auto-selected {len(func_names)} size-changed functions from {len(changed)} total")
 
-    out_path = getattr(args, 'out', None)
+    out_path = _opt(args, 'out')
     all_diffs = []
     bin_a = os.path.basename(info_a.get("binary", "?"))
     bin_b = os.path.basename(info_b.get("binary", "?"))
@@ -2241,8 +2235,8 @@ def cmd_code_diff(args, config):
 
 def cmd_auto_rename(args, config):
     """Heuristic auto-rename sub_ functions."""
-    dry_run = not getattr(args, 'apply', False)
-    max_funcs = getattr(args, 'max_funcs', 200) or 200
+    dry_run = not _opt(args, 'apply', False)
+    max_funcs = _opt(args, 'max_funcs', 200) or 200
     p = {"dry_run": dry_run, "max_funcs": max_funcs}
     r = _rpc_call(args, config, "auto_rename", p)
     if not r:
@@ -2263,7 +2257,7 @@ def cmd_auto_rename(args, config):
 
 def cmd_export_script(args, config):
     """Generate IDAPython script from analysis modifications."""
-    out_path = getattr(args, 'output', 'analysis.py') or 'analysis.py'
+    out_path = _opt(args, 'output', 'analysis.py') or 'analysis.py'
     p = {"output": out_path}
     r = _rpc_call(args, config, "export_script", p)
     if not r:
@@ -2282,9 +2276,9 @@ def cmd_export_script(args, config):
 def cmd_vtables(args, config):
     """Detect virtual function tables."""
     p = {}
-    if getattr(args, 'max', None):
+    if _opt(args, 'max'):
         p["max_results"] = args.max
-    if getattr(args, 'min_entries', None):
+    if _opt(args, 'min_entries'):
         p["min_entries"] = args.min_entries
     r = _rpc_call(args, config, "detect_vtables", p)
     if not r:
@@ -2328,7 +2322,7 @@ def _merge_project_config(config):
 
 def cmd_sigs(args, config):
     """Manage FLIRT signatures."""
-    action = getattr(args, 'action', 'list')
+    action = _opt(args, 'action', 'list')
 
     if action == "list":
         r = _rpc_call(args, config, "list_sigs")
@@ -2353,9 +2347,9 @@ def cmd_update(args):
     repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     git_dir = os.path.join(repo_dir, ".git")
     if not os.path.isdir(git_dir):
-        print(f"[-] Not a git repository: {repo_dir}")
+        _log_err(f"Not a git repository: {repo_dir}")
         return
-    print(f"[*] Updating from: {repo_dir}")
+    _log_info(f"Updating from: {repo_dir}")
     try:
         result = subprocess.run(
             ["git", "-C", repo_dir, "pull", "--ff-only"],
@@ -2363,16 +2357,16 @@ def cmd_update(args):
         )
         print(result.stdout.strip())
         if result.returncode != 0:
-            print(f"[-] {result.stderr.strip()}")
+            _log_err(result.stderr.strip())
     except FileNotFoundError:
-        print("[-] git not found in PATH")
+        _log_err("git not found in PATH")
     except subprocess.TimeoutExpired:
-        print("[-] git pull timed out")
+        _log_err("git pull timed out")
 
 
 def cmd_completions(args):
     """Generate shell completion scripts."""
-    shell = getattr(args, 'shell', 'bash')
+    shell = _opt(args, 'shell', 'bash')
     commands = [
         "start", "stop", "status", "wait", "list", "logs", "cleanup",
         "functions", "strings", "imports", "exports", "segments",
@@ -2430,7 +2424,7 @@ Register-ArgumentCompleter -CommandName ida-cli -Native -ScriptBlock {{
     }}
 }}""")
     else:
-        print(f"[-] Unsupported shell: {shell}. Use bash, zsh, or powershell.")
+        _log_err(f"Unsupported shell: {shell}. Use bash, zsh, or powershell.")
 
 
 # ─────────────────────────────────────────────

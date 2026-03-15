@@ -53,6 +53,12 @@ SEGPERM_READ = 4
 SEGPERM_WRITE = 2
 SEGPERM_EXEC = 1
 
+# Auto-generated name prefixes (skip during annotation export/script generation)
+AUTO_GENERATED_PREFIXES = (
+    "sub_", "nullsub_", "loc_", "unk_", "byte_", "word_",
+    "dword_", "qword_", "off_", "stru_", "asc_",
+)
+
 
 # ─────────────────────────────────────────────
 # Registry helpers (server-specific)
@@ -822,24 +828,13 @@ def _handle_save_db(params):
 # Annotations export/import
 # ─────────────────────────────────────────────
 
-def _handle_export_annotations(params):
-    """Export all user-applied names, comments, and types."""
-    import idc, idautils, ida_funcs, ida_nalt
-    annotations = {
-        "binary": os.path.basename(idc.get_input_file_path()),
-        "imagebase": _fmt_addr(ida_nalt.get_imagebase()),
-        "names": [],
-        "comments": [],
-        "types": [],
-    }
-    _auto_prefixes = ("sub_", "nullsub_", "loc_", "unk_", "byte_", "word_",
-                      "dword_", "qword_", "off_", "stru_", "asc_")
-    # Collect renamed functions
+def _collect_function_annotations(annotations):
+    """Collect names, comments, and types from functions."""
+    import idc, idautils
     for ea in idautils.Functions():
         name = idc.get_func_name(ea)
-        if name and not any(name.startswith(p) for p in _auto_prefixes):
+        if name and not any(name.startswith(p) for p in AUTO_GENERATED_PREFIXES):
             annotations["names"].append({"addr": _fmt_addr(ea), "name": name})
-        # Comments
         cmt = idc.get_cmt(ea, False)
         rcmt = idc.get_cmt(ea, True)
         fcmt = idc.get_func_cmt(ea, False)
@@ -849,30 +844,43 @@ def _handle_export_annotations(params):
             if rcmt: entry["repeatable"] = rcmt
             if fcmt: entry["func_comment"] = fcmt
             annotations["comments"].append(entry)
-        # Types
         type_str = idc.get_type(ea)
         if type_str:
             annotations["types"].append({"addr": _fmt_addr(ea), "type": type_str})
-    # Also collect non-function names (globals, data labels)
+
+
+def _collect_global_names(annotations):
+    """Collect non-function names (globals, data labels)."""
+    import idautils, ida_funcs
     for item in idautils.Names():
         ea = item[0]
         name = item[1]
-        if not any(name.startswith(p) for p in _auto_prefixes):
+        if not any(name.startswith(p) for p in AUTO_GENERATED_PREFIXES):
             func = ida_funcs.get_func(ea)
             if not func:
                 annotations["names"].append({"addr": _fmt_addr(ea), "name": name})
+
+
+def _handle_export_annotations(params):
+    """Export all user-applied names, comments, and types."""
+    import idc, ida_nalt
+    annotations = {
+        "binary": os.path.basename(idc.get_input_file_path()),
+        "imagebase": _fmt_addr(ida_nalt.get_imagebase()),
+        "names": [],
+        "comments": [],
+        "types": [],
+    }
+    _collect_function_annotations(annotations)
+    _collect_global_names(annotations)
     saved_to = _save_output(params.get("output"), annotations, fmt="json")
     annotations["saved_to"] = saved_to
     return annotations
 
 
-def _handle_import_annotations(params):
-    """Import annotations from JSON."""
-    import idc, ida_typeinf
-    data = params.get("data")
-    if not data:
-        raise RpcError("INVALID_PARAMS", "data parameter required (JSON annotations)")
-    stats = {"names": 0, "comments": 0, "types": 0, "errors": 0}
+def _import_names(data, stats):
+    """Import name annotations."""
+    import idc
     for entry in data.get("names", []):
         try:
             ea = _resolve_addr(entry["addr"])
@@ -880,6 +888,11 @@ def _handle_import_annotations(params):
             stats["names"] += 1
         except Exception:
             stats["errors"] += 1
+
+
+def _import_comments(data, stats):
+    """Import comment annotations."""
+    import idc
     for entry in data.get("comments", []):
         try:
             ea = _resolve_addr(entry["addr"])
@@ -892,6 +905,11 @@ def _handle_import_annotations(params):
             stats["comments"] += 1
         except Exception:
             stats["errors"] += 1
+
+
+def _import_types(data, stats):
+    """Import type annotations."""
+    import ida_typeinf
     for entry in data.get("types", []):
         try:
             ea = _resolve_addr(entry["addr"])
@@ -903,6 +921,17 @@ def _handle_import_annotations(params):
             stats["types"] += 1
         except Exception:
             stats["errors"] += 1
+
+
+def _handle_import_annotations(params):
+    """Import annotations from JSON."""
+    data = params.get("data")
+    if not data:
+        raise RpcError("INVALID_PARAMS", "data parameter required (JSON annotations)")
+    stats = {"names": 0, "comments": 0, "types": 0, "errors": 0}
+    _import_names(data, stats)
+    _import_comments(data, stats)
+    _import_types(data, stats)
     if _config["analysis"]["auto_save"]:
         save_db()
     return stats
@@ -1400,9 +1429,52 @@ def _handle_decompile_diff(params):
 # Auto-rename (heuristic)
 # ─────────────────────────────────────────────
 
+def _suggest_name_by_string(ea):
+    """Strategy 1: Suggest function name based on string references."""
+    import idc, idautils
+    for item_ea in idautils.FuncItems(ea):
+        for xref in idautils.DataRefsFrom(item_ea):
+            s = idc.get_strlit_contents(xref)
+            if s and len(s) >= 4:
+                try:
+                    s = s.decode("utf-8", errors="ignore")
+                except Exception:
+                    s = str(s)
+                clean = ""
+                for ch in s[:40]:
+                    if ch.isalnum() or ch == '_':
+                        clean += ch
+                    elif ch in (' ', '-', '.', '/'):
+                        clean += '_'
+                clean = clean.strip('_')
+                if clean and len(clean) >= 3 and not clean[0].isdigit():
+                    return f"fn_{clean}"
+    return None
+
+
+def _suggest_name_by_api(ea):
+    """Strategy 2: Suggest function name based on API calls."""
+    import idc, idautils, ida_xref
+    _skip_funcs = ("__security_check_cookie", "memset_0", "_guard_dispatch_icall")
+    api_calls = []
+    for item_ea in idautils.FuncItems(ea):
+        for xref in idautils.XrefsFrom(item_ea):
+            target_name = idc.get_func_name(xref.to)
+            if target_name and not target_name.startswith("sub_") and not target_name.startswith("nullsub_"):
+                if xref.type in (ida_xref.fl_CF, ida_xref.fl_CN):
+                    api_calls.append(target_name)
+    for api in api_calls:
+        if api in _skip_funcs:
+            continue
+        clean = api.split("@")[0].lstrip("?_")
+        if clean and len(clean) >= 3:
+            return f"calls_{clean[:30]}"
+    return None
+
+
 def _handle_auto_rename(params):
     """Heuristic-based automatic function renaming."""
-    import idc, idautils, ida_funcs, ida_xref
+    import idc, idautils, ida_funcs
     max_funcs = min(int(params.get("max_funcs", 200)), 1000)
     dry_run = params.get("dry_run", True)
 
@@ -1419,51 +1491,7 @@ def _handle_auto_rename(params):
         if not func:
             continue
 
-        suggested = None
-
-        # Strategy 1: String reference based naming
-        for item_ea in idautils.FuncItems(ea):
-            for xref in idautils.DataRefsFrom(item_ea):
-                s = idc.get_strlit_contents(xref)
-                if s and len(s) >= 4:
-                    try:
-                        s = s.decode("utf-8", errors="ignore")
-                    except Exception:
-                        s = str(s)
-                    # Clean string for function name
-                    clean = ""
-                    for ch in s[:40]:
-                        if ch.isalnum() or ch == '_':
-                            clean += ch
-                        elif ch in (' ', '-', '.', '/'):
-                            clean += '_'
-                    clean = clean.strip('_')
-                    if clean and len(clean) >= 3 and not clean[0].isdigit():
-                        suggested = f"fn_{clean}"
-                        break
-            if suggested:
-                break
-
-        # Strategy 2: API call based naming
-        if not suggested:
-            api_calls = []
-            for item_ea in idautils.FuncItems(ea):
-                for xref in idautils.XrefsFrom(item_ea):
-                    target_name = idc.get_func_name(xref.to)
-                    if target_name and not target_name.startswith("sub_") and not target_name.startswith("nullsub_"):
-                        if xref.type in (ida_xref.fl_CF, ida_xref.fl_CN):
-                            api_calls.append(target_name)
-            if api_calls:
-                # Use the most distinctive API call
-                for api in api_calls:
-                    # Skip common runtime functions
-                    if api in ("__security_check_cookie", "memset_0", "_guard_dispatch_icall"):
-                        continue
-                    clean = api.split("@")[0].lstrip("?_")
-                    if clean and len(clean) >= 3:
-                        suggested = f"calls_{clean[:30]}"
-                        break
-
+        suggested = _suggest_name_by_string(ea) or _suggest_name_by_api(ea)
         if suggested:
             # Ensure unique
             if idc.get_name_ea_simple(suggested) != idc.BADADDR:
@@ -1495,18 +1523,16 @@ def _handle_export_script(params):
         "import ida_typeinf",
         "",
     ]
-    _auto_prefixes = ("sub_", "nullsub_", "loc_", "unk_", "byte_", "word_",
-                      "dword_", "qword_", "off_", "stru_", "asc_")
     # Renames
     rename_count = 0
     for ea in idautils.Functions():
         name = idc.get_func_name(ea)
-        if name and not any(name.startswith(p) for p in _auto_prefixes):
+        if name and not any(name.startswith(p) for p in AUTO_GENERATED_PREFIXES):
             lines.append(f'idc.set_name({_fmt_addr(ea)}, "{name}", idc.SN_NOWARN)')
             rename_count += 1
     for item in idautils.Names():
         ea, name = item[0], item[1]
-        if not any(name.startswith(p) for p in _auto_prefixes):
+        if not any(name.startswith(p) for p in AUTO_GENERATED_PREFIXES):
             func = ida_funcs.get_func(ea)
             if not func:
                 lines.append(f'idc.set_name({_fmt_addr(ea)}, "{name}", idc.SN_NOWARN)')
