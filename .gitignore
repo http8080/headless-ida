@@ -1,3 +1,20 @@
 __pycache__/
 *.pyc
 .claude/settings.local.json
+
+# IDA database files
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+
+# Server logs & auth
+*.log
+*.log.*
+*.stderr
+auth_token
+
+# Sample binaries
+samples/
