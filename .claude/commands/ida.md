@@ -166,6 +166,31 @@ ida-cli list
 - `--offset`으로 페이징 (대량 함수 탐색 시)
 - `--json` 모드로 구조화된 데이터 활용
 
+## 일괄 분석
+```bash
+# 디렉토리 내 모든 바이너리 한번에 분석
+ida-cli batch <디렉토리> --idb-dir . --timeout 300
+
+# 분석 프로필 실행 (malware/firmware/vuln)
+ida-cli -b <hint> profile run malware
+ida-cli -b <hint> profile run vuln
+ida-cli -b <hint> profile run firmware
+```
+
+## 북마크 (분석 세션 간 주소 태깅)
+```bash
+# 북마크 추가
+ida-cli bookmark add <주소> <태그> --note "설명" -b <hint>
+
+# 북마크 목록
+ida-cli bookmark list
+ida-cli bookmark list --tag vuln
+
+# 북마크 삭제
+ida-cli bookmark remove <주소>
+```
+> 북마크는 현재 프로젝트 디렉토리에 `.ida-bookmarks.json`으로 저장됩니다.
+
 ## 에러 대응
 - 분석 실패 시: `ida-cli logs <id> --tail 20`
 - .i64 손상/잠김 시 (`open_database returned 2`): 기존 .i64 삭제 후 `--fresh`로 재시작

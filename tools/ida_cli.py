@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ida_cli.py — IDA Headless CLI entry point for Claude
+"""ida_cli.py -IDA Headless CLI entry point for Claude
 
 Usage:
     ida_cli.py start <binary> [--fresh] [--force]
@@ -1072,6 +1072,421 @@ def cmd_diff(args, config):
             print(f"    ... and {len(size_diff) - 30} more")
 
 
+def cmd_batch(args, config, config_path):
+    """Analyze all binaries in a directory."""
+    target_dir = os.path.abspath(args.directory)
+    if not os.path.isdir(target_dir):
+        print(f"[-] Not a directory: {target_dir}")
+        return
+
+    # Supported binary extensions (common ones)
+    _BIN_EXTS = {
+        ".exe", ".dll", ".sys", ".so", ".dylib", ".o", ".obj",
+        ".elf", ".bin", ".ko", ".axf", ".hex", ".srec", ".efi",
+    }
+
+    # Find binaries
+    binaries = []
+    for f in sorted(os.listdir(target_dir)):
+        fpath = os.path.join(target_dir, f)
+        if not os.path.isfile(fpath):
+            continue
+        ext = os.path.splitext(f)[1].lower()
+        if ext in _BIN_EXTS:
+            binaries.append(fpath)
+            continue
+        # No extension -try magic bytes
+        if not ext:
+            try:
+                with open(fpath, "rb") as fp:
+                    magic = fp.read(4)
+                if magic in (b"\x7fELF", b"MZ") or magic[:2] == b"MZ":
+                    binaries.append(fpath)
+            except Exception:
+                pass
+
+    if not binaries:
+        print(f"[-] No binaries found in: {target_dir}")
+        return
+
+    idb_dir = getattr(args, 'idb_dir', None)
+    if not idb_dir:
+        idb_dir = os.environ.get('IDA_IDB_DIR')
+    fresh = getattr(args, 'fresh', False)
+    timeout = getattr(args, 'timeout', 300)
+    max_concurrent = config["analysis"]["max_instances"]
+
+    print(f"[*] Found {len(binaries)} binaries in {target_dir}")
+    print(f"[*] Max concurrent: {max_concurrent}, Timeout: {timeout}s")
+    if idb_dir:
+        print(f"[*] IDB dir: {idb_dir}")
+    print()
+
+    # Process in batches
+    results = []
+    for batch_start in range(0, len(binaries), max_concurrent):
+        batch = binaries[batch_start:batch_start + max_concurrent]
+        started = []
+
+        # Start batch
+        for bpath in batch:
+            bname = os.path.basename(bpath)
+            arch_info = arch_detect(bpath)
+            instance_id = make_instance_id(bpath)
+            idb_path = get_idb_path(config, os.path.normcase(os.path.abspath(bpath)),
+                                     instance_id, False, idb_dir=idb_dir)
+
+            if not _register_instance(config, instance_id, os.path.normcase(os.path.abspath(bpath)),
+                                       arch_info, idb_path,
+                                       os.path.join(config["paths"]["log_dir"], f"{instance_id}.log"),
+                                       False):
+                print(f"  [-] {bname}: failed to register")
+                continue
+
+            try:
+                proc = _spawn_server(config, config_path, os.path.normcase(os.path.abspath(bpath)),
+                                      instance_id, idb_path,
+                                      os.path.join(config["paths"]["log_dir"], f"{instance_id}.log"),
+                                      fresh)
+                fmt = arch_info.get("file_format", "?")
+                arch = arch_info.get("arch", "?")
+                bits = arch_info.get("bits", "?")
+                print(f"  [+] {bname} ({fmt} {arch} {bits}bit) -> {instance_id}")
+                started.append((instance_id, bname))
+            except Exception as e:
+                print(f"  [-] {bname}: {e}")
+
+        if not started:
+            continue
+
+        # Wait for all in batch
+        print(f"\n[*] Waiting for {len(started)} instances...")
+        deadline = time.time() + timeout
+        poll = config["analysis"]["wait_poll_interval"]
+        pending = set(iid for iid, _ in started)
+        while pending and time.time() < deadline:
+            time.sleep(poll)
+            registry = load_registry()
+            for iid in list(pending):
+                info = registry.get(iid, {})
+                state = info.get("state", "unknown")
+                if state == "ready":
+                    pending.discard(iid)
+                elif state == "error":
+                    pending.discard(iid)
+
+        # Collect results
+        registry = load_registry()
+        for iid, bname in started:
+            info = registry.get(iid, {})
+            state = info.get("state", "unknown")
+            port = info.get("port")
+            if state == "ready" and port:
+                resp = post_rpc(config, port, "summary", iid)
+                if "result" in resp:
+                    r = resp["result"]
+                    results.append((bname, iid, r))
+                    print(f"  {bname:<30}  funcs={r['func_count']:<6}  "
+                          f"strings={r['total_strings']:<6}  "
+                          f"imports={r['total_imports']:<6}  "
+                          f"decompiler={'Y' if r['decompiler'] else 'N'}")
+                else:
+                    print(f"  {bname:<30}  [ready but summary failed]")
+            else:
+                print(f"  {bname:<30}  [{state}]")
+
+    # Summary
+    print(f"\n[+] Batch complete: {len(results)}/{len(binaries)} analyzed")
+    if results:
+        print(f"\n  Active instances:")
+        for bname, iid, _ in results:
+            print(f"    {iid}  {bname}")
+        print(f"\n  Use 'ida-cli -b <hint> decompile <addr>' to analyze further")
+        if not getattr(args, 'keep', False):
+            print(f"  Use 'ida-cli stop <id>' to stop, or 'ida-cli cleanup' to clean all")
+
+
+# ─────────────────────────────────────────────
+# Bookmark System
+# ─────────────────────────────────────────────
+
+_BOOKMARK_FILE = ".ida-bookmarks.json"
+
+
+def _get_bookmark_path():
+    return os.path.join(os.getcwd(), _BOOKMARK_FILE)
+
+
+def _load_bookmarks():
+    path = _get_bookmark_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_bookmarks(bookmarks):
+    path = _get_bookmark_path()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(bookmarks, f, ensure_ascii=False, indent=2)
+
+
+def cmd_bookmark(args, config):
+    action = getattr(args, 'action', 'list')
+    bookmarks = _load_bookmarks()
+
+    if action == "add":
+        addr = args.addr
+        tag = args.tag
+        note = getattr(args, 'note', None) or ""
+        binary_hint = getattr(args, 'binary_hint', None) or ""
+
+        # Try to resolve binary name from active instance
+        binary = binary_hint
+        if binary_hint:
+            registry = load_registry()
+            for iid, info in registry.items():
+                if binary_hint.lower() in info.get("binary", "").lower():
+                    binary = info.get("binary", binary_hint)
+                    break
+
+        if binary not in bookmarks:
+            bookmarks[binary] = []
+
+        # Check for duplicate
+        for bm in bookmarks[binary]:
+            if bm["addr"] == addr and bm["tag"] == tag:
+                print(f"[!] Bookmark already exists: {addr} [{tag}]")
+                return
+
+        bookmarks[binary].append({
+            "addr": addr,
+            "tag": tag,
+            "note": note,
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        _save_bookmarks(bookmarks)
+        print(f"[+] Bookmark added: {addr} [{tag}] {note}")
+
+    elif action == "remove":
+        addr = args.addr
+        binary_hint = getattr(args, 'binary_hint', None) or ""
+        removed = False
+        for binary in list(bookmarks.keys()):
+            if binary_hint and binary_hint.lower() not in binary.lower():
+                continue
+            before = len(bookmarks[binary])
+            bookmarks[binary] = [bm for bm in bookmarks[binary] if bm["addr"] != addr]
+            if len(bookmarks[binary]) < before:
+                removed = True
+            if not bookmarks[binary]:
+                del bookmarks[binary]
+        if removed:
+            _save_bookmarks(bookmarks)
+            print(f"[+] Bookmark removed: {addr}")
+        else:
+            print(f"[-] No bookmark found at {addr}")
+
+    else:  # list
+        tag_filter = getattr(args, 'tag', None)
+        binary_filter = getattr(args, 'binary_hint', None)
+        if not bookmarks:
+            print("[*] No bookmarks. Use: ida-cli bookmark add <addr> <tag> [--note 'text']")
+            return
+        total = 0
+        for binary, bms in sorted(bookmarks.items()):
+            if binary_filter and binary_filter.lower() not in binary.lower():
+                continue
+            filtered = bms
+            if tag_filter:
+                filtered = [bm for bm in bms if tag_filter.lower() in bm["tag"].lower()]
+            if not filtered:
+                continue
+            print(f"  {binary}:")
+            for bm in filtered:
+                note = f"  {bm['note']}" if bm.get('note') else ""
+                print(f"    {bm['addr']}  [{bm['tag']}]{note}")
+                total += 1
+        print(f"\n  Total: {total} bookmarks")
+
+
+# ─────────────────────────────────────────────
+# Config Profiles
+# ─────────────────────────────────────────────
+
+_PROFILES = {
+    "malware": {
+        "description": "Malware analysis -focus on C2, crypto, anti-analysis",
+        "analysis_steps": [
+            "summary",
+            "strings --filter http --count 30",
+            "strings --filter socket --count 20",
+            "strings --filter crypt --count 20",
+            "imports --filter socket --count 30",
+            "imports --filter crypt --count 30",
+            "imports --filter process --count 30",
+            "imports --filter registry --count 20",
+            "find_func --regex 'crypt|encode|decode|xor|rc4|aes' --max 30",
+            "find_func --regex 'connect|send|recv|http|url' --max 30",
+            "find_func --regex 'inject|hook|patch|virtual' --max 20",
+        ],
+    },
+    "firmware": {
+        "description": "Firmware/IoT -focus on peripherals, protocols, boot",
+        "analysis_steps": [
+            "summary",
+            "segments",
+            "strings --filter uart --count 20",
+            "strings --filter spi --count 20",
+            "strings --filter gpio --count 20",
+            "strings --filter error --count 30",
+            "imports --count 50",
+            "exports --count 50",
+            "find_func --regex 'uart|spi|i2c|gpio|dma' --max 30",
+            "find_func --regex 'init|setup|config|reset' --max 30",
+            "find_func --regex 'read|write|send|recv' --max 30",
+        ],
+    },
+    "vuln": {
+        "description": "Vulnerability research -focus on dangerous functions, buffers",
+        "analysis_steps": [
+            "summary",
+            "imports --filter memcpy --count 20",
+            "imports --filter strcpy --count 20",
+            "imports --filter sprintf --count 20",
+            "imports --filter gets --count 10",
+            "imports --filter system --count 10",
+            "imports --filter exec --count 10",
+            "imports --filter alloc --count 20",
+            "find_func --regex 'parse|decode|deserialize|unpack' --max 30",
+            "find_func --regex 'auth|login|verify|check_pass' --max 20",
+            "find_func --regex 'handle|dispatch|process|callback' --max 30",
+        ],
+    },
+}
+
+
+def cmd_profile(args, config):
+    action = getattr(args, 'action', 'list')
+
+    if action == "list":
+        print("  Available profiles:")
+        for name, prof in _PROFILES.items():
+            print(f"    {name:<12}  {prof['description']}")
+        return
+
+    if action == "run":
+        profile_name = args.profile_name
+        if profile_name not in _PROFILES:
+            print(f"[-] Unknown profile: {profile_name}")
+            print(f"    Available: {', '.join(_PROFILES.keys())}")
+            return
+
+        profile = _PROFILES[profile_name]
+        print(f"[*] Running profile: {profile_name} -{profile['description']}")
+        print()
+
+        iid, info = resolve_instance(args, config)
+        if not iid:
+            return
+        if info.get("state") != "ready":
+            print(f"[-] Instance {iid} is not ready")
+            return
+        port = info.get("port")
+
+        out_dir = getattr(args, 'out_dir', None)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        for step in profile["analysis_steps"]:
+            parts = step.split()
+            method = parts[0]
+            print(f"  --- {step} ---")
+
+            # Parse simple params from step string
+            params = {}
+            i = 1
+            while i < len(parts):
+                if parts[i] == "--filter" and i + 1 < len(parts):
+                    params["filter"] = parts[i + 1]
+                    i += 2
+                elif parts[i] == "--count" and i + 1 < len(parts):
+                    params["count"] = int(parts[i + 1])
+                    i += 2
+                elif parts[i] == "--max" and i + 1 < len(parts):
+                    params["max_results"] = int(parts[i + 1])
+                    i += 2
+                elif parts[i] == "--regex":
+                    params["regex"] = True
+                    i += 1
+                    if i < len(parts) and not parts[i].startswith("--"):
+                        params["name"] = parts[i].strip("'\"")
+                        i += 1
+                else:
+                    # Positional arg (e.g., name for find_func)
+                    if method == "find_func" and "name" not in params:
+                        params["name"] = parts[i].strip("'\"")
+                    i += 1
+
+            if out_dir:
+                params["output"] = os.path.join(out_dir, f"{method}_{params.get('filter', 'all')}.txt")
+
+            # Map CLI command name to RPC method
+            rpc_map = {
+                "summary": "summary",
+                "segments": "get_segments",
+                "strings": "get_strings",
+                "imports": "get_imports",
+                "exports": "get_exports",
+                "find_func": "find_func",
+                "functions": "get_functions",
+            }
+            rpc_method = rpc_map.get(method, method)
+
+            resp = post_rpc(config, port, rpc_method, iid, params=params)
+            if "error" in resp:
+                print(f"    [-] {resp['error'].get('message', '?')}")
+                continue
+
+            r = resp.get("result", {})
+            if method == "summary":
+                print(f"    Functions: {r.get('func_count')}  "
+                      f"Strings: {r.get('total_strings')}  "
+                      f"Imports: {r.get('total_imports')}  "
+                      f"Decompiler: {r.get('decompiler')}")
+            elif method in ("strings", "imports", "exports", "functions"):
+                data = r.get("data", [])
+                total = r.get("total", 0)
+                showing = len(data)
+                print(f"    Total: {total}, Showing: {showing}")
+                for d in data[:10]:
+                    if "value" in d:
+                        print(f"      {d['addr']}  {d['value'][:60]}")
+                    elif "module" in d:
+                        print(f"      {d['addr']}  {d.get('module', ''):<20}  {d['name']}")
+                    elif "name" in d:
+                        print(f"      {d['addr']}  {d['name']}")
+                if showing > 10:
+                    print(f"      ... ({showing - 10} more)")
+            elif method == "find_func":
+                matches = r.get("matches", [])
+                print(f"    Found: {r.get('total', 0)}")
+                for m in matches[:10]:
+                    print(f"      {m['addr']}  {m['name']}")
+                if len(matches) > 10:
+                    print(f"      ... ({len(matches) - 10} more)")
+            elif method == "segments":
+                for s in r.get("data", []):
+                    print(f"      {s['start_addr']}-{s['end_addr']}  "
+                          f"{s.get('name') or '':<12}  {s.get('perm') or ''}")
+            print()
+
+        print(f"[+] Profile '{profile_name}' complete")
+        if out_dir:
+            print(f"    Results saved to: {out_dir}")
+
+
 def cmd_update(args):
     """Self-update from git repository."""
     repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1190,6 +1605,9 @@ def _build_dispatch(args, config, config_path):
         "exec": lambda: cmd_proxy_exec(args, config),
         "summary": lambda: cmd_proxy_summary(args, config),
         "diff": lambda: cmd_diff(args, config),
+        "batch": lambda: cmd_batch(args, config, config_path),
+        "bookmark": lambda: cmd_bookmark(args, config),
+        "profile": lambda: cmd_profile(args, config),
         "update": lambda: cmd_update(args),
         "completions": lambda: cmd_completions(args),
     }
@@ -1323,6 +1741,31 @@ def main():
     p = sub.add_parser("diff", help="Compare two instances", parents=[common])
     p.add_argument("instance_a", help="Instance ID or binary hint")
     p.add_argument("instance_b", help="Instance ID or binary hint")
+
+    p = sub.add_parser("batch", help="Batch analyze directory", parents=[common])
+    p.add_argument("directory", help="Directory containing binaries")
+    p.add_argument("--idb-dir", default=None, help="IDB save directory")
+    p.add_argument("--fresh", action="store_true")
+    p.add_argument("--timeout", type=int, default=300)
+    p.add_argument("--keep", action="store_true", help="Keep instances running after batch")
+
+    bm = sub.add_parser("bookmark", help="Manage bookmarks")
+    bm_sub = bm.add_subparsers(dest="action")
+    bm_add = bm_sub.add_parser("add", help="Add bookmark", parents=[common])
+    bm_add.add_argument("addr")
+    bm_add.add_argument("tag")
+    bm_add.add_argument("--note", default=None)
+    bm_rm = bm_sub.add_parser("remove", help="Remove bookmark", parents=[common])
+    bm_rm.add_argument("addr")
+    bm_list = bm_sub.add_parser("list", help="List bookmarks", parents=[common])
+    bm_list.add_argument("--tag", default=None, help="Filter by tag")
+
+    prof = sub.add_parser("profile", help="Run analysis profile", parents=[common])
+    prof_sub = prof.add_subparsers(dest="action")
+    prof_list = prof_sub.add_parser("list", help="List profiles")
+    prof_run = prof_sub.add_parser("run", help="Run a profile")
+    prof_run.add_argument("profile_name", choices=["malware", "firmware", "vuln"])
+    prof_run.add_argument("--out-dir", default=None, help="Save results to directory")
 
     sub.add_parser("update", help="Self-update from git")
 

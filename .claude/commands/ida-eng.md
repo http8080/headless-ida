@@ -167,6 +167,31 @@ The fastest way to reach target code:
 - Use `--offset` for pagination (browsing large function lists)
 - Use `--json` mode for structured data
 
+## Batch Analysis
+```bash
+# Analyze all binaries in a directory at once
+ida-cli batch <directory> --idb-dir . --timeout 300
+
+# Run analysis profile (malware/firmware/vuln)
+ida-cli -b <hint> profile run malware
+ida-cli -b <hint> profile run vuln
+ida-cli -b <hint> profile run firmware
+```
+
+## Bookmarks (address tagging across sessions)
+```bash
+# Add bookmark
+ida-cli bookmark add <addr> <tag> --note "description" -b <hint>
+
+# List bookmarks
+ida-cli bookmark list
+ida-cli bookmark list --tag vuln
+
+# Remove bookmark
+ida-cli bookmark remove <addr>
+```
+> Bookmarks are saved as `.ida-bookmarks.json` in the current project directory.
+
 ## Error Handling
 - Analysis failure: `ida-cli logs <id> --tail 20`
 - Locked/corrupted .i64 (`open_database returned 2`): delete the .i64 file, then restart with `--fresh`
