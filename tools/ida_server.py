@@ -429,10 +429,10 @@ def _handle_get_segments(params):
 # Analysis API
 # ─────────────────────────────────────────────
 
-def _handle_decompile(params):
-    _require_decompiler()
+def _decompile_func(ea):
+    """Decompile function at ea. Returns (func, code, name)."""
     import ida_hexrays, idc
-    ea = _resolve_addr(params.get("addr"))
+    _require_decompiler()
     func = _require_function(ea)
     try:
         cfunc = ida_hexrays.decompile(func.start_ea)
@@ -442,6 +442,12 @@ def _handle_decompile(params):
     except ida_hexrays.DecompilationFailure as e:
         raise RpcError("DECOMPILE_FAILED", str(e))
     name = idc.get_func_name(func.start_ea) or ""
+    return func, code, name
+
+
+def _handle_decompile(params):
+    ea = _resolve_addr(params.get("addr"))
+    func, code, name = _decompile_func(ea)
     saved_to = _save_output(params.get("output"), code)
     return {"addr": _fmt_addr(func.start_ea), "name": name,
             "code": code, "saved_to": saved_to}
@@ -449,18 +455,9 @@ def _handle_decompile(params):
 
 def _handle_decompile_with_xrefs(params):
     """Decompile + xrefs_to in a single call."""
-    _require_decompiler()
-    import ida_hexrays, idc, idautils
+    import idautils, idc, ida_funcs
     ea = _resolve_addr(params.get("addr"))
-    func = _require_function(ea)
-    try:
-        cfunc = ida_hexrays.decompile(func.start_ea)
-        if not cfunc:
-            raise RpcError("DECOMPILE_FAILED", f"Decompile returned None at {_fmt_addr(ea)}")
-        code = str(cfunc)
-    except ida_hexrays.DecompilationFailure as e:
-        raise RpcError("DECOMPILE_FAILED", str(e))
-    name = idc.get_func_name(func.start_ea) or ""
+    func, code, name = _decompile_func(ea)
     # Collect xrefs to this function
     callers = []
     for xref in idautils.XrefsTo(func.start_ea):
@@ -1199,15 +1196,23 @@ def _handle_list_structs(params):
     return {"total": len(structs), "structs": structs}
 
 
+def _get_named_type(name, check_fn, not_found_code, not_type_code, not_type_msg):
+    """Look up a named type, validate with check_fn, or raise RpcError."""
+    import ida_typeinf
+    tif = ida_typeinf.tinfo_t()
+    if not tif.get_named_type(ida_typeinf.get_idati(), name):
+        raise RpcError(not_found_code, f"{not_type_msg} not found: {name}")
+    if not check_fn(tif):
+        raise RpcError(not_type_code, f"{name} is not a {not_type_msg}")
+    return tif
+
+
 def _handle_get_struct(params):
     """Get struct details with members."""
     import ida_typeinf
     name = _require_param(params, "name")
-    tif = ida_typeinf.tinfo_t()
-    if not tif.get_named_type(ida_typeinf.get_idati(), name):
-        raise RpcError("STRUCT_NOT_FOUND", f"Struct not found: {name}")
-    if not (tif.is_struct() or tif.is_union()):
-        raise RpcError("NOT_A_STRUCT", f"{name} is not a struct/union")
+    tif = _get_named_type(name, lambda t: t.is_struct() or t.is_union(),
+                          "STRUCT_NOT_FOUND", "NOT_A_STRUCT", "struct/union")
     members = []
     udt = ida_typeinf.udt_type_data_t()
     if tif.get_udt_details(udt):
@@ -1227,9 +1232,17 @@ def _handle_get_struct(params):
     }
 
 
+def _create_type_decl(decl, err_code, err_label):
+    """Parse a type declaration and save DB. Raises on failure."""
+    import ida_typeinf
+    result = ida_typeinf.idc_parse_types(decl, 0)
+    if result != 0:
+        raise RpcError(err_code, f"Cannot create {err_label}: {decl}")
+    _maybe_save_db()
+
+
 def _handle_create_struct(params):
     """Create a new struct via type declaration."""
-    import ida_typeinf
     name = _require_param(params, "name")
     is_union = params.get("is_union", False)
     members = params.get("members", [])
@@ -1253,10 +1266,7 @@ def _handle_create_struct(params):
         decl = f"{keyword} {name} {{\n{body}\n}};"
     else:
         decl = f"{keyword} {name} {{ char __placeholder; }};"
-    result = ida_typeinf.idc_parse_types(decl, 0)
-    if result != 0:
-        raise RpcError("CREATE_STRUCT_FAILED", f"Cannot create struct: {decl}")
-    _maybe_save_db()
+    _create_type_decl(decl, "CREATE_STRUCT_FAILED", "struct")
     return {"ok": True, "name": name, "members_added": len(members)}
 
 
@@ -1344,11 +1354,8 @@ def _handle_get_enum(params):
     """Get enum details with members."""
     import ida_typeinf
     name = _require_param(params, "name")
-    tif = ida_typeinf.tinfo_t()
-    if not tif.get_named_type(ida_typeinf.get_idati(), name):
-        raise RpcError("ENUM_NOT_FOUND", f"Enum not found: {name}")
-    if not tif.is_enum():
-        raise RpcError("NOT_AN_ENUM", f"{name} is not an enum")
+    tif = _get_named_type(name, lambda t: t.is_enum(),
+                          "ENUM_NOT_FOUND", "NOT_AN_ENUM", "enum")
     members = []
     edt = ida_typeinf.enum_type_data_t()
     if tif.get_enum_details(edt):
@@ -1360,7 +1367,6 @@ def _handle_get_enum(params):
 
 def _handle_create_enum(params):
     """Create a new enum via type declaration."""
-    import ida_typeinf
     name = _require_param(params, "name")
     members = params.get("members", [])
     if members:
@@ -1376,10 +1382,7 @@ def _handle_create_enum(params):
         decl = f"enum {name} {{\n{body}\n}};"
     else:
         decl = f"enum {name} {{ __placeholder }};"
-    result = ida_typeinf.idc_parse_types(decl, 0)
-    if result != 0:
-        raise RpcError("CREATE_ENUM_FAILED", f"Cannot create enum: {decl}")
-    _maybe_save_db()
+    _create_type_decl(decl, "CREATE_ENUM_FAILED", "enum")
     return {"ok": True, "name": name, "members_added": len(members)}
 
 

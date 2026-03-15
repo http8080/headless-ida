@@ -354,12 +354,20 @@ def _ensure_ready(iid, info):
     return port, True
 
 
-def _rpc_call(args, config, method, params=None):
+def _resolve_ready(args, config):
+    """Resolve instance and ensure ready. Returns (iid, info, port) or (None, None, None)."""
     iid, info = resolve_instance(args, config)
     if not iid:
-        return None
+        return None, None, None
     port, ok = _ensure_ready(iid, info)
     if not ok:
+        return None, None, None
+    return iid, info, port
+
+
+def _rpc_call(args, config, method, params=None):
+    iid, info, port = _resolve_ready(args, config)
+    if not iid:
         return None
     resp = post_rpc(config, port, method, iid, params=params)
     if "error" in resp:
@@ -850,6 +858,13 @@ def _check_inline_limit(text, config):
     return truncated, True
 
 
+def _maybe_output_param(args, p, md_out=False):
+    """Add output param to p if --out is set and not markdown output."""
+    out = _opt(args, 'out')
+    if out and not md_out:
+        p["output"] = out
+
+
 def _build_params(args, mapping):
     """Build RPC params dict from args attributes. mapping: {attr_name: param_key}"""
     p = {}
@@ -924,8 +939,7 @@ def cmd_proxy_decompile(args, config):
     with_xrefs = _opt(args, 'with_xrefs', False)
     md_out = _is_md_out(args)
     p = {"addr": args.addr}
-    if _opt(args, 'out') and not md_out:
-        p["output"] = args.out
+    _maybe_output_param(args, p, md_out)
     method = "decompile_with_xrefs" if with_xrefs else "decompile"
     r = _rpc_call(args, config, method, p)
     if not r: return
@@ -956,8 +970,7 @@ def cmd_proxy_decompile(args, config):
 def cmd_proxy_decompile_batch(args, config):
     md_out = _is_md_out(args)
     p = {"addrs": args.addrs}
-    if _opt(args, 'out') and not md_out:
-        p["output"] = args.out
+    _maybe_output_param(args, p, md_out)
     r = _rpc_call(args, config, "decompile_batch", p)
     if not r: return
     if md_out:
@@ -1100,7 +1113,7 @@ def cmd_proxy_save(args, config):
 
 def cmd_proxy_exec(args, config):
     p = {"code": args.code}
-    if _opt(args, 'out'): p["output"] = args.out
+    _maybe_output_param(args, p)
     r = _rpc_call(args, config, "exec", p)
     if not r: return
     if r.get("stdout"):
@@ -1597,11 +1610,8 @@ def cmd_profile(args, config):
         _log_info(f"Running profile: {profile_name} - {profile['description']}")
         print()
 
-        iid, info = resolve_instance(args, config)
+        iid, info, port = _resolve_ready(args, config)
         if not iid:
-            return
-        port, ok = _ensure_ready(iid, info)
-        if not ok:
             return
 
         out_dir = _opt(args, 'out_dir')
@@ -1739,11 +1749,8 @@ def _render_html(content, binary_name):
 
 def cmd_report(args, config):
     """Generate markdown/HTML analysis report."""
-    iid, info = resolve_instance(args, config)
+    iid, info, port = _resolve_ready(args, config)
     if not iid:
-        return
-    port, ok = _ensure_ready(iid, info)
-    if not ok:
         return
     out_path = args.output
     binary_name = info.get("binary", "unknown")
@@ -1764,11 +1771,8 @@ def cmd_report(args, config):
 
 def cmd_shell(args, config):
     """Interactive IDA Python REPL."""
-    iid, info = resolve_instance(args, config)
+    iid, info, port = _resolve_ready(args, config)
     if not iid:
-        return
-    port, ok = _ensure_ready(iid, info)
-    if not ok:
         return
     binary = os.path.basename(info.get("binary", "?"))
     _log_info(f"IDA Python Shell - {binary} ({iid})")
