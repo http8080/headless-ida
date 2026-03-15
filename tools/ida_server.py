@@ -808,36 +808,38 @@ def _heartbeat_loop(instance_id, interval):
 
 _decompiler_available = False
 
-# inf_get_procname() → (32bit_plugin, 64bit_plugin)
-_DECOMPILER_MAP = {
-    "metapc": ("hexrays", "hexx64"),
-    "ARM":    ("hexarm",  "hexarm64"),
-    "mips":   ("hexmips", "hexmips64"),
-    "PPC":    ("hexppc",  "hexppc64"),
-    "RISCV":  ("hexrv",   "hexrv64"),
-}
-
 
 def _load_decompiler():
+    """Load Hex-Rays decompiler plugin (IDA 9.x unified plugin names)."""
     global _decompiler_available
-    import ida_ida, ida_loader, ida_hexrays
+    import ida_ida, ida_idp, ida_loader, ida_hexrays
 
+    # IDA 9.x: unified plugins — no separate 32/64-bit variants
+    _PLFM_MAP = {
+        ida_idp.PLFM_386:   "hexx64",
+        ida_idp.PLFM_ARM:   "hexarm",
+        ida_idp.PLFM_PPC:   "hexppc",
+        ida_idp.PLFM_MIPS:  "hexmips",
+        ida_idp.PLFM_RISCV: "hexrv",
+    }
+
+    cpu_id = ida_idp.ph.id
     proc_name = ida_ida.inf_get_procname()
     is_64 = ida_ida.inf_is_64bit()
-    entry = _DECOMPILER_MAP.get(proc_name)
-    plugin_name = entry[1 if is_64 else 0] if entry else None
+    plugin_name = _PLFM_MAP.get(cpu_id)
 
-    log.info(f"Processor: {proc_name}, 64bit={is_64}")
+    log.info(f"Processor: '{proc_name}', ph.id={cpu_id}, 64bit={is_64}")
 
-    if plugin_name:
-        plg = ida_loader.load_plugin(plugin_name)
-        if plg and ida_hexrays.init_hexrays_plugin():
-            log.info(f"Decompiler loaded: {plugin_name}")
-            _decompiler_available = True
-        else:
-            log.error(f"Decompiler load failed: {plugin_name}")
+    if not plugin_name:
+        log.warning(f"No decompiler for: proc='{proc_name}' ph.id={cpu_id}")
+        return
+
+    log.info(f"Loading decompiler plugin: {plugin_name}")
+    if ida_loader.load_plugin(plugin_name) and ida_hexrays.init_hexrays_plugin():
+        log.info(f"Decompiler loaded: {plugin_name}")
+        _decompiler_available = True
     else:
-        log.warning(f"No decompiler mapping for processor: {proc_name}")
+        log.error(f"Decompiler load failed: {plugin_name}")
 
 
 # ─────────────────────────────────────────────
