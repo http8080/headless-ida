@@ -167,7 +167,7 @@ def cmd_wait(args, config):
         state = info.get("state", "unknown")
         port = info.get("port")
         if state in ("initializing", "analyzing"):
-            remaining = int(deadline - time.time())
+            remaining = max(0, int(deadline - time.time()))
             _log_info(f"{state}... ({remaining}s remaining)")
             time.sleep(poll)
             continue
@@ -195,7 +195,6 @@ def cmd_list(args, config):
         _log_info("No active instances")
         return
     if _opt(args, 'json_output', False):
-        import json
         out = {}
         for iid, info in registry.items():
             out[iid] = {
@@ -373,7 +372,7 @@ def cmd_proxy_decompile_batch(args, config):
     if md_out:
         _save_local(args.out, _md_decompile_batch(r))
         return
-    lines = [f"Total: {r['total']}, Success: {r['success']}, Failed: {r['failed']}"]
+    lines = [f"Total: {r.get('total', 0)}, Success: {r.get('success', 0)}, Failed: {r.get('failed', 0)}"]
     for func in r.get("functions", []):
         if "code" in func:
             lines.append(f"\n// -- {func['name']} ({func['addr']}) --")
@@ -1776,9 +1775,6 @@ def cmd_update(args):
             break
         repo_dir = os.path.dirname(repo_dir)
     else:
-        _log_err("Not inside a git repository")
-        return
-    if not os.path.isdir(os.path.join(repo_dir, ".git")):
         _log_err("Not inside a git repository")
         return
     _log_info(f"Updating from: {repo_dir}")

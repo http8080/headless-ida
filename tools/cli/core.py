@@ -461,10 +461,11 @@ def _spawn_server(config, config_path, binary_path, instance_id, idb_path, log_p
         cmd.append("--fresh")
     env = os.environ.copy()
     env["IDADIR"] = config["ida"]["install_dir"]
-    stderr_file = open(log_path + ".stderr", "w") if log_path else subprocess.DEVNULL
+    stderr_file = open(log_path + ".stderr", "w") if log_path else None
     popen_kwargs = dict(
         env=env,
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr_file,
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=stderr_file if stderr_file else subprocess.DEVNULL,
     )
     if sys.platform == "win32":
         popen_kwargs["creationflags"] = (
@@ -474,9 +475,13 @@ def _spawn_server(config, config_path, binary_path, instance_id, idb_path, log_p
         # Unix: detach via double-fork behavior with start_new_session
         popen_kwargs["start_new_session"] = True
     try:
-        return subprocess.Popen(cmd, **popen_kwargs)
+        proc = subprocess.Popen(cmd, **popen_kwargs)
+        # Close our copy of the file handle; subprocess inherits its own
+        if stderr_file:
+            stderr_file.close()
+        return proc
     except Exception:
-        if stderr_file is not subprocess.DEVNULL:
+        if stderr_file:
             stderr_file.close()
         raise
 

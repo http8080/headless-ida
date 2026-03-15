@@ -184,7 +184,7 @@ def _build_parser():
 
     p = sub.add_parser("bytes", parents=[common])
     p.add_argument("addr")
-    p.add_argument("size")
+    p.add_argument("size", type=int)
 
     p = sub.add_parser("find_pattern", parents=[common])
     p.add_argument("pattern")
