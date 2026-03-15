@@ -88,6 +88,10 @@ ida-cli -b <hint> find_pattern "48 8B ? ? 00" --max 20
 # 주석 조회
 ida-cli -b <hint> comments <주소>
 
+# 임의 IDA Python 코드 실행 (security.exec_enabled=true 필요)
+ida-cli -b <hint> exec "import idautils; print(len(list(idautils.Functions())))"
+ida-cli -b <hint> exec "import idc; print(idc.get_segm_name(0x140001000))"
+
 # 사용 가능한 RPC 메서드 목록
 ida-cli -b <hint> methods
 ```
@@ -190,6 +194,31 @@ ida-cli bookmark list --tag vuln
 ida-cli bookmark remove <주소>
 ```
 > 북마크는 현재 프로젝트 디렉토리에 `.ida-bookmarks.json`으로 저장됩니다.
+
+## 리포트 생성
+```bash
+# 마크다운 리포트 생성
+ida-cli -b <hint> report output.md
+
+# HTML 리포트 생성
+ida-cli -b <hint> report output.html
+
+# 특정 함수 디컴파일 포함
+ida-cli -b <hint> report output.md --functions 0x401000 0x402000
+
+# 개별 명령어에서도 .md 출력 지원
+ida-cli -b <hint> decompile <주소> --with-xrefs --out result.md
+ida-cli -b <hint> decompile_batch <addr1> <addr2> --out batch.md
+```
+> 리포트 포함 항목: summary, segments, imports, exports, strings, bookmarks, 선택적 함수 디컴파일
+
+## 임의 IDA Python 실행
+```bash
+# config.json에서 security.exec_enabled=true 설정 필요
+ida-cli -b <hint> exec "import idautils; print(len(list(idautils.Functions())))"
+ida-cli -b <hint> exec "import idc; print(idc.get_segm_name(0x140001000))"
+```
+> 기본 제공 명령어로 커버되지 않는 IDA Python API 호출에 사용
 
 ## 에러 대응
 - 분석 실패 시: `ida-cli logs <id> --tail 20`

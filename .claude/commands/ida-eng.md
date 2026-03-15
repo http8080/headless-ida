@@ -88,6 +88,10 @@ ida-cli -b <hint> find_pattern "48 8B ? ? 00" --max 20
 # Get comments
 ida-cli -b <hint> comments <addr>
 
+# Execute arbitrary IDA Python code (requires security.exec_enabled=true)
+ida-cli -b <hint> exec "import idautils; print(len(list(idautils.Functions())))"
+ida-cli -b <hint> exec "import idc; print(idc.get_segm_name(0x140001000))"
+
 # List available RPC methods
 ida-cli -b <hint> methods
 ```
@@ -191,6 +195,31 @@ ida-cli bookmark list --tag vuln
 ida-cli bookmark remove <addr>
 ```
 > Bookmarks are saved as `.ida-bookmarks.json` in the current project directory.
+
+## Report Generation
+```bash
+# Generate markdown report
+ida-cli -b <hint> report output.md
+
+# Generate HTML report
+ida-cli -b <hint> report output.html
+
+# Include specific function decompilations
+ida-cli -b <hint> report output.md --functions 0x401000 0x402000
+
+# Markdown output also works with individual commands
+ida-cli -b <hint> decompile <addr> --with-xrefs --out result.md
+ida-cli -b <hint> decompile_batch <addr1> <addr2> --out batch.md
+```
+> Reports include: summary, segments, imports, exports, strings, bookmarks, and optionally decompiled functions.
+
+## Arbitrary IDA Python Execution
+```bash
+# Requires security.exec_enabled=true in config.json
+ida-cli -b <hint> exec "import idautils; print(len(list(idautils.Functions())))"
+ida-cli -b <hint> exec "import idc; print(idc.get_segm_name(0x140001000))"
+```
+> Use exec for any IDA Python API call not covered by built-in commands.
 
 ## Error Handling
 - Analysis failure: `ida-cli logs <id> --tail 20`

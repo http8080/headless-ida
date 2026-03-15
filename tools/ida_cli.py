@@ -691,6 +691,77 @@ def cmd_cleanup(args, config):
 # Commands: Analysis/Modification Proxies
 # ─────────────────────────────────────────────
 
+def _is_md_out(args):
+    """Check if --out path ends with .md"""
+    out = getattr(args, 'out', None)
+    return out and out.lower().endswith('.md')
+
+
+def _save_local(path, content):
+    """Save content to a local file from CLI side."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    print(f"[+] Saved to: {path}")
+
+
+def _md_decompile(r, with_xrefs=False):
+    """Format decompile result as markdown."""
+    name = r.get('name', '')
+    addr = r.get('addr', '')
+    code = r.get('code', '')
+    lines = [f"# {name}", f"**Address**: `{addr}`", "", "```c", code, "```"]
+    if with_xrefs:
+        callers = r.get("callers", [])
+        callees = r.get("callees", [])
+        if callers:
+            lines += ["", f"## Callers ({len(callers)})", "| Address | Function | Type |", "|---------|----------|------|"]
+            for c in callers:
+                lines.append(f"| `{c['from_addr']}` | {c['from_name']} | {c['type']} |")
+        if callees:
+            lines += ["", f"## Callees ({len(callees)})", "| Address | Function | Type |", "|---------|----------|------|"]
+            for c in callees:
+                lines.append(f"| `{c['to_addr']}` | {c['to_name']} | {c['type']} |")
+    return "\n".join(lines) + "\n"
+
+
+def _md_decompile_batch(r):
+    """Format batch decompile result as markdown."""
+    lines = [f"# Batch Decompile", f"**Total**: {r['total']}, **Success**: {r['success']}, **Failed**: {r['failed']}", ""]
+    for func in r.get("functions", []):
+        if "code" in func:
+            lines += [f"## {func['name']} (`{func['addr']}`)", "", "```c", func["code"], "```", ""]
+        else:
+            lines += [f"## `{func.get('addr', '?')}` - ERROR", f"> {func.get('error', '?')}", ""]
+    return "\n".join(lines)
+
+
+def _md_summary(r):
+    """Format summary result as markdown."""
+    lines = [f"# Binary Summary: {r.get('binary', 'unknown')}", ""]
+    lines += ["## Overview", "| Property | Value |", "|----------|-------|"]
+    for key in ("ida_version", "decompiler", "func_count", "total_strings", "total_imports", "export_count", "avg_func_size"):
+        if key in r:
+            lines.append(f"| {key} | {r[key]} |")
+    if r.get("segments"):
+        lines += ["", "## Segments", "| Name | Start | End | Size | Perm |", "|------|-------|-----|------|------|"]
+        for s in r["segments"]:
+            lines.append(f"| {s.get('name', '')} | `{s.get('start', '')}` | `{s.get('end', '')}` | {s.get('size', '')} | {s.get('perm', '')} |")
+    if r.get("top_import_modules"):
+        lines += ["", "## Top Import Modules"]
+        for m in r["top_import_modules"]:
+            lines.append(f"- **{m['module']}**: {m['count']} imports")
+    if r.get("largest_functions"):
+        lines += ["", "## Largest Functions", "| Address | Name | Size |", "|---------|------|------|"]
+        for f in r["largest_functions"]:
+            lines.append(f"| `{f['addr']}` | {f['name']} | {f['size']} |")
+    if r.get("strings_sample"):
+        lines += ["", "## String Samples"]
+        for s in r["strings_sample"][:20]:
+            lines.append(f"- `{s.get('addr', '')}`: {s.get('value', '')}")
+    return "\n".join(lines) + "\n"
+
+
 def _check_inline_limit(text, config):
     """Truncate and return a warning if max_inline_lines is exceeded."""
     limit = config.get("output", {}).get("max_inline_lines", 200)
@@ -772,11 +843,16 @@ def cmd_proxy_segments(args, config):
 
 def cmd_proxy_decompile(args, config):
     with_xrefs = getattr(args, 'with_xrefs', False)
+    md_out = _is_md_out(args)
     p = {"addr": args.addr}
-    if getattr(args, 'out', None): p["output"] = args.out
+    if getattr(args, 'out', None) and not md_out:
+        p["output"] = args.out
     method = "decompile_with_xrefs" if with_xrefs else "decompile"
     r = _rpc_call(args, config, method, p)
     if not r: return
+    if md_out:
+        _save_local(args.out, _md_decompile(r, with_xrefs))
+        return
     header = f"// {r.get('name', '')} @ {r.get('addr', '')}"
     code = r.get("code", "")
     output = f"{header}\n{code}"
@@ -799,10 +875,15 @@ def cmd_proxy_decompile(args, config):
 
 
 def cmd_proxy_decompile_batch(args, config):
+    md_out = _is_md_out(args)
     p = {"addrs": args.addrs}
-    if getattr(args, 'out', None): p["output"] = args.out
+    if getattr(args, 'out', None) and not md_out:
+        p["output"] = args.out
     r = _rpc_call(args, config, "decompile_batch", p)
     if not r: return
+    if md_out:
+        _save_local(args.out, _md_decompile_batch(r))
+        return
     lines = [f"Total: {r['total']}, Success: {r['success']}, Failed: {r['failed']}"]
     for func in r.get("functions", []):
         if "code" in func:
@@ -1487,6 +1568,145 @@ def cmd_profile(args, config):
             print(f"    Results saved to: {out_dir}")
 
 
+def cmd_report(args, config):
+    """Generate markdown/HTML analysis report."""
+    iid, info = resolve_instance(args, config)
+    if not iid:
+        return
+    if info.get("state") != "ready":
+        print(f"[-] Instance {iid} is not ready")
+        return
+    port = info.get("port")
+    out_path = args.output
+    binary_name = info.get("binary", "unknown")
+
+    sections = []
+
+    # Title
+    import datetime
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    sections.append(f"# Analysis Report: {os.path.basename(binary_name)}")
+    sections.append(f"**Generated**: {ts}  ")
+    sections.append(f"**Binary**: `{binary_name}`")
+    sections.append("")
+
+    # Summary
+    print("[*] Collecting summary...")
+    resp = post_rpc(config, port, "summary", iid)
+    if "result" in resp:
+        sections.append(_md_summary(resp["result"]))
+
+    # Segments (already in summary, skip if present)
+
+    # Imports
+    print("[*] Collecting imports...")
+    resp = post_rpc(config, port, "get_imports", iid, {"count": 100})
+    if "result" in resp:
+        data = resp["result"].get("data", [])
+        total = resp["result"].get("total", 0)
+        if data:
+            sections.append(f"## Imports ({total} total, showing {len(data)})")
+            sections.append("| Address | Module | Name |")
+            sections.append("|---------|--------|------|")
+            for d in data:
+                sections.append(f"| `{d['addr']}` | {d.get('module', '')} | {d['name']} |")
+            sections.append("")
+
+    # Exports
+    print("[*] Collecting exports...")
+    resp = post_rpc(config, port, "get_exports", iid, {"count": 100})
+    if "result" in resp:
+        data = resp["result"].get("data", [])
+        total = resp["result"].get("total", 0)
+        if data:
+            sections.append(f"## Exports ({total} total, showing {len(data)})")
+            sections.append("| Address | Name |")
+            sections.append("|---------|------|")
+            for d in data:
+                sections.append(f"| `{d['addr']}` | {d['name']} |")
+            sections.append("")
+
+    # Strings sample
+    print("[*] Collecting strings...")
+    resp = post_rpc(config, port, "get_strings", iid, {"count": 50})
+    if "result" in resp:
+        data = resp["result"].get("data", [])
+        total = resp["result"].get("total", 0)
+        if data:
+            sections.append(f"## Strings ({total} total, showing {len(data)})")
+            sections.append("| Address | Value |")
+            sections.append("|---------|-------|")
+            for d in data:
+                val = d.get("value", "").replace("|", "\\|")
+                sections.append(f"| `{d['addr']}` | {val} |")
+            sections.append("")
+
+    # Decompile specific functions if requested
+    func_addrs = getattr(args, 'functions', None) or []
+    if func_addrs:
+        sections.append("## Decompiled Functions")
+        sections.append("")
+        for addr in func_addrs:
+            print(f"[*] Decompiling {addr}...")
+            resp = post_rpc(config, port, "decompile_with_xrefs", iid, {"addr": addr})
+            if "result" in resp:
+                sections.append(_md_decompile(resp["result"], with_xrefs=True))
+            else:
+                err = resp.get("error", {}).get("message", "unknown error")
+                sections.append(f"### `{addr}` - Error")
+                sections.append(f"> {err}")
+            sections.append("")
+
+    # Bookmarks
+    bookmarks = _load_bookmarks()
+    if bookmarks:
+        bm_for_binary = {}
+        for bname, bms in bookmarks.items():
+            if os.path.basename(binary_name).lower() in bname.lower():
+                bm_for_binary[bname] = bms
+        if bm_for_binary:
+            sections.append("## Bookmarks")
+            sections.append("| Address | Tag | Note |")
+            sections.append("|---------|-----|------|")
+            for bname, bms in bm_for_binary.items():
+                for bm in bms:
+                    note = bm.get("note", "").replace("|", "\\|")
+                    sections.append(f"| `{bm['addr']}` | {bm['tag']} | {note} |")
+            sections.append("")
+
+    # Footer
+    sections.append("---")
+    sections.append("*Generated by ida-cli report*")
+
+    content = "\n".join(sections) + "\n"
+
+    # HTML conversion
+    if out_path.lower().endswith('.html'):
+        try:
+            import markdown
+            html_body = markdown.markdown(content, extensions=["tables"])
+        except ImportError:
+            # Minimal HTML wrapping without markdown library
+            html_body = f"<pre>{content}</pre>"
+        html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Report: {os.path.basename(binary_name)}</title>
+<style>
+body {{ font-family: -apple-system, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; }}
+table {{ border-collapse: collapse; width: 100%; margin: 10px 0; }}
+th, td {{ border: 1px solid #ddd; padding: 6px 10px; text-align: left; }}
+th {{ background: #f5f5f5; }}
+pre, code {{ background: #f5f5f5; padding: 2px 6px; border-radius: 3px; }}
+pre {{ padding: 12px; overflow-x: auto; }}
+</style></head><body>
+{html_body}
+</body></html>"""
+        _save_local(out_path, html)
+    else:
+        _save_local(out_path, content)
+
+    print(f"[+] Report generated: {out_path}")
+
+
 def cmd_update(args):
     """Self-update from git repository."""
     repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1608,6 +1828,7 @@ def _build_dispatch(args, config, config_path):
         "batch": lambda: cmd_batch(args, config, config_path),
         "bookmark": lambda: cmd_bookmark(args, config),
         "profile": lambda: cmd_profile(args, config),
+        "report": lambda: cmd_report(args, config),
         "update": lambda: cmd_update(args),
         "completions": lambda: cmd_completions(args),
     }
@@ -1766,6 +1987,10 @@ def main():
     prof_run = prof_sub.add_parser("run", help="Run a profile")
     prof_run.add_argument("profile_name", choices=["malware", "firmware", "vuln"])
     prof_run.add_argument("--out-dir", default=None, help="Save results to directory")
+
+    p = sub.add_parser("report", help="Generate analysis report", parents=[common])
+    p.add_argument("output", help="Output file (.md or .html)")
+    p.add_argument("--functions", nargs="*", default=[], help="Function addresses to decompile")
 
     sub.add_parser("update", help="Self-update from git")
 

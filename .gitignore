@@ -16,5 +16,8 @@ __pycache__/
 *.stderr
 auth_token
 
+# Project-local data
+.ida-bookmarks.json
+
 # Sample binaries
 samples/
